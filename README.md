@@ -249,6 +249,7 @@ Single script to manage the full stack. Dynamic port allocation with conflict de
 ./ailegal.sh status            # Service status with ports and uptime
 ./ailegal.sh logs [service]    # Tail logs (all or specific service)
 ./ailegal.sh ports             # Port allocation table with conflict detection
+./ailegal.sh ports:auto        # Auto-reallocate ports to resolve conflicts
 ./ailegal.sh smoke             # Curl-based smoke tests on all endpoints
 ./ailegal.sh shell <service>   # Open shell in container
 
@@ -268,6 +269,7 @@ Single script to manage the full stack. Dynamic port allocation with conflict de
 
 # Reset
 ./ailegal.sh clean             # Remove containers and volumes
+./ailegal.sh reset             # Destroy all data (volumes + database) — confirms first
 ./ailegal.sh nuke              # Full reset: clean + rebuild + migrate + seed
 ```
 
