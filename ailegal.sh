@@ -40,6 +40,7 @@ NC='\033[0m'
 PORT_LABELS=(  postgres  redis  minio_api  minio_console  gotrue  postgrest  pgadmin  glitchtip  backend  frontend  nginx)
 PORT_VARS=(    POSTGRES_PORT REDIS_PORT MINIO_API_PORT MINIO_CONSOLE_PORT GOTRUE_PORT POSTGREST_PORT PGADMIN_PORT GLITCHTIP_PORT BACKEND_PORT FRONTEND_PORT NGINX_PORT)
 PORT_DEFAULTS=(5432      6379   9000       9001           9999    3002       5050     8000       3001     3000       80)
+PORT_SERVICES=(postgres  redis  minio      minio          gotrue  postgrest  pgadmin  glitchtip  backend  frontend  nginx)
 
 BOOT_ORDER=(postgres redis minio gotrue postgrest pgadmin glitchtip glitchtip-worker backend frontend nginx)
 
@@ -129,8 +130,9 @@ ensure_dynamic_ports() {
     local var="${PORT_VARS[$i]}"
     local port="${!var}"
     local label="${PORT_LABELS[$i]}"
+    local service="${PORT_SERVICES[$i]}"
     if ! is_port_free "$port"; then
-      local container_name="${PROJECT_NAME}-${label}-1"
+      local container_name="${PROJECT_NAME}-${service}-1"
       local holder
       holder=$(docker inspect --format='{{.Name}}' "$container_name" 2>/dev/null || echo "")
       if [ -n "$holder" ]; then
@@ -162,10 +164,11 @@ cmd_ports() {
     local label="${PORT_LABELS[$i]}"
     local var="${PORT_VARS[$i]}"
     local port="${!var}"
+    local service="${PORT_SERVICES[$i]}"
     local status_color="$GREEN"
     local status_text="free"
     if ! is_port_free "$port"; then
-      local container_name="${PROJECT_NAME}-${label//_/-}-1"
+      local container_name="${PROJECT_NAME}-${service}-1"
       local holder
       holder=$(docker inspect --format='{{.Name}}' "$container_name" 2>/dev/null || echo "")
       if [ -n "$holder" ]; then
