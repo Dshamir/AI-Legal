@@ -16,3 +16,7 @@ next-env.d.ts
 .DS_Store
 .vercel
 coverage
+
+# Docker
+docker-compose.override.yml
+backups/
