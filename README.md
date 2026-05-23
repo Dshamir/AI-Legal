@@ -1,156 +1,188 @@
 # Mike
 
-Mike is a legal document assistant with a Next.js frontend, an Express backend, Supabase Auth/Postgres, and Cloudflare R2-compatible object storage.
+Mike is a self-hosted legal document assistant with a Next.js frontend, Express backend, PostgreSQL (via Prisma ORM), GoTrue authentication, MinIO object storage, Redis caching, and GlitchTip error tracking. All 11 services are containerized and managed by a single orchestration script.
 
 Website: [mikeoss.com](https://mikeoss.com)
 
 ## Contents
 
-- `frontend/` - Next.js application
-- `backend/` - Express API, Supabase access, document processing, and database schema
-- `backend/schema.sql` - Supabase schema for fresh databases
-- `backend/migrations/` - incremental database updates for existing deployments
+- `frontend/` — Next.js 16 application (React 19, Tailwind CSS 4)
+- `backend/` — Express REST API with Prisma ORM, Pino logging, Zod validation
+- `backend/prisma/schema.prisma` — database schema (17 models, 7 enums)
+- `nginx/` — reverse proxy configuration
+- `ailegal.sh` — orchestration script for all services
+- `docker-compose.yml` — 11-service container stack
+
+## Quick Start (Docker)
+
+```bash
+# 1. Clone and configure
+git clone https://github.com/Dshamir/AI-Legal.git
+cd AI-Legal
+cp .env.example .env
+# Edit .env — add at least one LLM provider key (Anthropic, Gemini, or OpenAI)
+
+# 2. Start everything
+./ailegal.sh up
+
+# 3. Open http://localhost
+```
+
+Sign up, add an API key in **Account > Models & API Keys** if not set in `.env`, then create a project and start chatting with documents.
+
+## Services
+
+| Service              | Port        | Purpose                                  |
+| -------------------- | ----------- | ---------------------------------------- |
+| **nginx**            | 80          | Reverse proxy (single entry point)       |
+| **frontend**         | 3000        | Next.js web application                  |
+| **backend**          | 3001        | Express REST API                         |
+| **postgres**         | 5432        | PostgreSQL 16 database                   |
+| **gotrue**           | 9999        | Authentication (Supabase-compatible JWT) |
+| **postgrest**        | 3002        | Auto-generated REST API over Postgres    |
+| **minio**            | 9000 / 9001 | S3-compatible object storage + console   |
+| **redis**            | 6379        | Caching layer                            |
+| **pgadmin**          | 5050        | Database admin GUI                       |
+| **glitchtip**        | 8000        | Error tracking (Sentry-compatible)       |
+| **glitchtip-worker** | —           | Background job processor                 |
+
+## Orchestration (`ailegal.sh`)
+
+```bash
+./ailegal.sh up                # Start all services (health-waited)
+./ailegal.sh down              # Stop all services
+./ailegal.sh health            # Health check status table
+./ailegal.sh status            # Service status with ports and uptime
+./ailegal.sh logs [service]    # Tail logs (all or specific service)
+./ailegal.sh shell <service>   # Open shell in container
+./ailegal.sh build [service]   # Build containers
+./ailegal.sh rebuild [service] # Force rebuild (no cache)
+./ailegal.sh restart [service] # Restart service(s)
+
+# Database
+./ailegal.sh db:migrate        # Run Prisma migrations
+./ailegal.sh db:seed           # Seed development data
+./ailegal.sh db:studio         # Open Prisma Studio
+./ailegal.sh db:backup         # Backup to timestamped file
+./ailegal.sh db:restore <file> # Restore from backup
+
+# Quality
+./ailegal.sh test              # Run Vitest test suite
+./ailegal.sh lint              # Run linters
+
+# Versioning
+./ailegal.sh bump <type>       # Version bump (patch/minor/major) + git tag
+
+# Reset
+./ailegal.sh clean             # Remove containers and volumes
+./ailegal.sh nuke              # Full reset: clean + rebuild + migrate + seed
+```
 
 ## Prerequisites
 
-- Node.js 20 or newer
+- Docker and Docker Compose
+- At least one LLM provider API key: Anthropic, Google Gemini, or OpenAI
+
+For development without Docker:
+
+- Node.js 20+
 - npm
-- git
-- A Supabase project
-- A Cloudflare R2 bucket, MinIO bucket, or another S3-compatible bucket
-- At least one supported model provider API key: Anthropic, Google Gemini, or OpenAI
-- LibreOffice installed locally if you need DOC/DOCX to PDF conversion
-
-## Database Setup
-
-For a new Supabase database, open the Supabase SQL editor and run:
-
-```sql
--- copy and run the contents of:
--- backend/schema.sql
-```
-
-The schema file is based on `supabase-migration.sql` and folds in the later files in `backend/migrations/`.
-
-For an existing database, do not run the full schema file over production data. Apply the incremental files in `backend/migrations/` instead.
+- PostgreSQL 16
+- Redis
+- MinIO or S3-compatible storage
+- LibreOffice (for DOC/DOCX to PDF conversion)
 
 ## Environment
 
-Create local env files:
+Copy `.env.example` to `.env` at the repo root. The file is organized by service:
+
+| Section   | Key Variables                                                                      |
+| --------- | ---------------------------------------------------------------------------------- |
+| Postgres  | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `DATABASE_URL`                               |
+| GoTrue    | `GOTRUE_JWT_SECRET`, `GOTRUE_SITE_URL`, `GOTRUE_MAILER_AUTOCONFIRM`                |
+| PostgREST | `PGRST_DB_URI`, `PGRST_JWT_SECRET`                                                 |
+| MinIO     | `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`, `R2_BUCKET_NAME`                         |
+| Redis     | `REDIS_URL`                                                                        |
+| Backend   | `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, `DOWNLOAD_SIGNING_SECRET` |
+| Frontend  | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_API_BASE_URL`                             |
+| GlitchTip | `GLITCHTIP_SECRET_KEY`, `SENTRY_DSN`                                               |
+| pgAdmin   | `PGADMIN_DEFAULT_EMAIL`, `PGADMIN_DEFAULT_PASSWORD`                                |
+
+Provider keys can be configured globally in `.env` or per user in **Account > Models & API Keys**.
+
+## Development Without Docker
 
 ```bash
-touch backend/.env
-touch frontend/.env.local
-```
-
-Create `backend/.env`:
-
-```bash
-PORT=3001
-FRONTEND_URL=http://localhost:3000
-DOWNLOAD_SIGNING_SECRET=replace-with-a-random-32-byte-hex-string
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SECRET_KEY=your-supabase-service-role-key
-
-R2_ENDPOINT_URL=https://your-account-id.r2.cloudflarestorage.com
-R2_ACCESS_KEY_ID=your-r2-access-key
-R2_SECRET_ACCESS_KEY=your-r2-secret-key
-R2_BUCKET_NAME=mike
-
-GEMINI_API_KEY=your-gemini-key
-ANTHROPIC_API_KEY=your-anthropic-key
-OPENAI_API_KEY=your-openai-key
-RESEND_API_KEY=your-resend-key
-USER_API_KEYS_ENCRYPTION_SECRET=your-long-random-secret
-```
-
-Create `frontend/.env.local`:
-
-```bash
-NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
-NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY=your-supabase-anon-key
-NEXT_PUBLIC_API_BASE_URL=http://localhost:3001
-```
-
-Supabase values come from the project dashboard. Use the project URL for `SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_URL`, the service role key for the backend `SUPABASE_SECRET_KEY`, and the anon/public key for `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY`. If your Supabase project shows multiple key formats, use the legacy JWT-style anon and service role keys expected by the Supabase client libraries.
-
-Provider keys are only needed for the models and email features you plan to use. Model provider keys can be configured in `backend/.env` for the whole instance, or per user in **Account > Models & API Keys**. If a provider key is present in `backend/.env`, that provider is available by default and the matching browser API key field is read-only.
-
-## Install
-
-Install each app package:
-
-```bash
+# Install
 npm install --prefix backend
 npm install --prefix frontend
+
+# Start (separate terminals)
+npm run dev --prefix backend    # Express on :3001 (tsx watch, auto-reloads)
+npm run dev --prefix frontend   # Next.js on :3000
+
+# Open http://localhost:3000
 ```
 
-## Run Locally
+Requires a running PostgreSQL with `DATABASE_URL` set, plus MinIO/S3 and Redis if using those features.
 
-Start the backend:
+## Database
+
+Mike uses **Prisma ORM** with PostgreSQL.
 
 ```bash
-npm run dev --prefix backend
+# Run migrations
+npx prisma migrate dev --prefix backend
+
+# Open visual editor
+npx prisma studio --prefix backend
+
+# Seed development data
+npx prisma db seed --prefix backend
 ```
 
-Start the main app:
+Schema: `backend/prisma/schema.prisma` — 17 models with soft-delete on projects, documents, chats, workflows, and reviews. All mutations are logged to an `audit_log` table.
+
+## Testing
 
 ```bash
-npm run dev --prefix frontend
+npm test --prefix backend       # Run Vitest (17 tests)
+npm run lint --prefix frontend  # ESLint
 ```
 
-Open `http://localhost:3000`.
+CI runs automatically via GitHub Actions on push/PR to `main` (lint, build on Node 20/22, test).
 
-## First Run
+Pre-commit hooks (Husky + lint-staged) auto-format staged files with Prettier.
 
-1. Sign up in the app.
-2. If you did not set provider keys in `backend/.env`, open **Account > Models & API Keys** and add an Anthropic, Gemini, or OpenAI API key.
-3. Create or open a project and start chatting with documents.
+## Architecture
+
+```
+nginx (:80) ─── reverse proxy
+  ├── / ──────── frontend (:3000)   Next.js 16 + React 19
+  ├── /api/ ──── backend (:3001)    Express + Prisma + Pino
+  ├── /rest/ ─── postgrest (:3002)  Auto REST API
+  ├── /pgadmin/  pgadmin (:5050)    DB admin
+  └── /glitchtip glitchtip (:8000)  Error tracking
+```
+
+**Backend stack**: Express, Prisma ORM, Zod validation, Pino structured logging, Helmet (CSP), rate limiting, HMAC-signed downloads, AES-256 encrypted user API keys with key rotation, magic-byte MIME file validation.
+
+**Frontend stack**: Next.js 16 App Router, React 19, Tailwind CSS 4, shadcn/ui, Tiptap editor, Recharts, React Compiler. Auth middleware protects routes. GlitchTip/Sentry for error tracking.
+
+**Multi-LLM support**: Anthropic Claude, Google Gemini, OpenAI — switchable per request via provider abstraction layer.
 
 ## Troubleshooting
 
-**Sign-up confirmation email never arrives.** Confirmation emails are sent by Supabase Auth, not by Mike. For local development, the simplest fix is to disable email confirmation in **Supabase > Authentication > Providers > Email**. For production, configure custom SMTP in Supabase; the built-in mailer is heavily rate-limited and may be restricted on newer projects.
+**Services won't start.** Run `./ailegal.sh health` to see which service is unhealthy. Check logs with `./ailegal.sh logs <service>`.
 
-**The model picker shows a missing-key warning.** Add a key for that provider in **Account > Models & API Keys**, or configure the provider key in `backend/.env` and restart the backend.
+**Sign-up confirmation email never arrives.** Set `GOTRUE_MAILER_AUTOCONFIRM=true` in `.env` for local development (auto-confirms all sign-ups).
 
-**DOC or DOCX conversion fails.** Install LibreOffice locally and restart the backend so document conversion commands are available on the process path.
+**The model picker shows a missing-key warning.** Add a key for that provider in **Account > Models & API Keys**, or set it in `.env` and restart: `./ailegal.sh restart backend`.
 
-## Docker Setup (Self-Hosted)
+**DOC or DOCX conversion fails.** LibreOffice is included in the Docker backend image. For non-Docker development, install LibreOffice locally.
 
-Copy and configure environment:
+**Database needs reset.** Run `./ailegal.sh nuke` for a full teardown, rebuild, and reseed.
 
-```bash
-cp .env.example .env
-# Edit .env with your API keys and secrets
-```
+## License
 
-Start all services:
-
-```bash
-./ailegal.sh up
-```
-
-Open `http://localhost` in your browser.
-
-### Common Commands
-
-```bash
-./ailegal.sh health          # Check all services
-./ailegal.sh status          # Service status table
-./ailegal.sh logs backend    # Tail backend logs
-./ailegal.sh db:migrate      # Run database migrations
-./ailegal.sh db:backup       # Backup database
-./ailegal.sh test            # Run test suite
-./ailegal.sh nuke            # Full reset and rebuild
-```
-
-See `./ailegal.sh help` for all commands.
-
-## Useful Checks
-
-```bash
-npm run build --prefix backend
-npm run build --prefix frontend
-npm run lint --prefix frontend
-npm test --prefix backend
-```
+AGPL-3.0-only
