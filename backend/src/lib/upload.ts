@@ -34,3 +34,34 @@ export function singleFileUpload(fieldName: string): RequestHandler {
     });
   };
 }
+
+const ALLOWED_EXTENSIONS = new Set(["pdf", "docx", "doc"]);
+const ALLOWED_MIMES = new Set([
+  "application/pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/msword",
+]);
+
+export async function validateFileType(
+  buffer: Buffer,
+  originalName: string,
+): Promise<{ valid: boolean; detectedType?: string }> {
+  const ext = originalName.split(".").pop()?.toLowerCase() ?? "";
+  if (!ALLOWED_EXTENSIONS.has(ext)) {
+    return { valid: false, detectedType: `disallowed extension: .${ext}` };
+  }
+
+  const { fileTypeFromBuffer } = await import("file-type");
+  const detected = await fileTypeFromBuffer(buffer);
+
+  if (!detected) {
+    if (ext === "doc") return { valid: true };
+    return { valid: false, detectedType: "unknown" };
+  }
+
+  if (!ALLOWED_MIMES.has(detected.mime)) {
+    return { valid: false, detectedType: detected.mime };
+  }
+
+  return { valid: true, detectedType: detected.mime };
+}
