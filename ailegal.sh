@@ -208,6 +208,7 @@ check_env() {
 # ---------------------------------------------------------------------------
 
 cmd_up() {
+  show_banner
   check_env
   ensure_dynamic_ports
   log_step "Starting Mike platform (${#BOOT_ORDER[@]} services)..."
@@ -562,10 +563,28 @@ cmd_nuke() {
 # Main router
 # ---------------------------------------------------------------------------
 
+show_banner() {
+  echo -e "${CYAN}"
+  cat << 'BANNER'
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║                                                                ║
+  ║    █████╗ ██╗    ██╗     ███████╗ ██████╗  █████╗ ██╗          ║
+  ║   ██╔══██╗██║    ██║     ██╔════╝██╔════╝ ██╔══██╗██║          ║
+  ║   ███████║██║    ██║     █████╗  ██║  ███╗███████║██║          ║
+  ║   ██╔══██║██║    ██║     ██╔══╝  ██║   ██║██╔══██║██║          ║
+  ║   ██║  ██║██║    ███████╗███████╗╚██████╔╝██║  ██║███████╗     ║
+  ║   ╚═╝  ╚═╝╚═╝    ╚══════╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝     ║
+  ║                                                                ║
+  ║          M I K E   P L A T F O R M   O R C H E S T R A T O R  ║
+  ║          11 services · dynamic ports · self-hosted             ║
+  ║                                                                ║
+  ╚══════════════════════════════════════════════════════════════════╝
+BANNER
+  echo -e "${NC}"
+}
+
 cmd_help() {
-  echo ""
-  echo -e "${BOLD}ailegal.sh${NC} — Mike Platform Orchestrator"
-  echo ""
+  show_banner
   echo -e "${CYAN}LIFECYCLE${NC}"
   echo "  up                   Start all services (health-waited, dynamic ports)"
   echo "  down                 Stop all services"
