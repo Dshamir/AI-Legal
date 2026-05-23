@@ -3,10 +3,7 @@ import { requireAuth } from "../middleware/auth";
 import { prisma } from "../lib/prisma";
 import { createClient } from "@supabase/supabase-js";
 import { logger } from "../lib/logger";
-import {
-  attachActiveVersionPaths,
-  attachLatestVersionNumbers,
-} from "../lib/documentVersions";
+import { attachActiveVersionPaths, attachLatestVersionNumbers } from "../lib/documentVersions";
 import { downloadFile, uploadFile, storageKey } from "../lib/storage";
 import { docxToPdf, convertedPdfKey } from "../lib/convert";
 import { checkProjectAccess } from "../lib/access";
@@ -57,8 +54,7 @@ projectsRouter.get("/", requireAuth, async (req, res) => {
   }
 
   const projects = [...ownProjects, ...sharedProjects].sort(
-    (a, b) =>
-      new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
   );
 
   const result = await Promise.all(
@@ -89,8 +85,7 @@ projectsRouter.post("/", requireAuth, async (req, res) => {
     cm_number?: string;
     shared_with?: string[];
   };
-  if (!name?.trim())
-    return void res.status(400).json({ detail: "name is required" });
+  if (!name?.trim()) return void res.status(400).json({ detail: "name is required" });
   const normalizedUserEmail = userEmail?.trim().toLowerCase();
   const cleanedSharedWith: string[] = [];
   const seenSharedEmails = new Set<string>();
@@ -100,9 +95,7 @@ projectsRouter.post("/", requireAuth, async (req, res) => {
       const e = raw.trim().toLowerCase();
       if (!e || seenSharedEmails.has(e)) continue;
       if (normalizedUserEmail && e === normalizedUserEmail) {
-        return void res
-          .status(400)
-          .json({ detail: "You cannot share a project with yourself." });
+        return void res.status(400).json({ detail: "You cannot share a project with yourself." });
       }
       seenSharedEmails.add(e);
       cleanedSharedWith.push(e);
@@ -137,16 +130,16 @@ projectsRouter.get("/:projectId", requireAuth, async (req, res) => {
   const project = await prisma.project.findUnique({
     where: { id: projectId },
   });
-  if (!project)
-    return void res.status(404).json({ detail: "Project not found" });
+  if (!project) return void res.status(404).json({ detail: "Project not found" });
 
   const canAccess =
     project.userId === userId ||
     (userEmail &&
       Array.isArray(project.sharedWith) &&
-      (project.sharedWith as string[]).includes(userEmail));
-  if (!canAccess)
-    return void res.status(404).json({ detail: "Project not found" });
+      (project.sharedWith as string[]).some(
+        (e) => (e ?? "").toLowerCase() === userEmail.toLowerCase(),
+      ));
+  if (!canAccess) return void res.status(404).json({ detail: "Project not found" });
 
   const [docs, folderData] = await Promise.all([
     prisma.document.findMany({
@@ -185,18 +178,14 @@ projectsRouter.get("/:projectId/people", requireAuth, async (req, res) => {
     where: { id: projectId },
     select: { id: true, userId: true, sharedWith: true },
   });
-  if (!project)
-    return void res.status(404).json({ detail: "Project not found" });
+  if (!project) return void res.status(404).json({ detail: "Project not found" });
 
   const isOwner = project.userId === userId;
-  const sharedWith = (Array.isArray(project.sharedWith)
-    ? (project.sharedWith as string[])
-    : []
+  const sharedWith = (
+    Array.isArray(project.sharedWith) ? (project.sharedWith as string[]) : []
   ).map((e) => e.toLowerCase());
-  const isShared =
-    !!userEmail && sharedWith.includes(userEmail.toLowerCase());
-  if (!isOwner && !isShared)
-    return void res.status(404).json({ detail: "Project not found" });
+  const isShared = !!userEmail && sharedWith.includes(userEmail.toLowerCase());
+  if (!isOwner && !isShared) return void res.status(404).json({ detail: "Project not found" });
 
   // Pull every auth user. Auth-user listing still uses Supabase admin API.
   const admin = getSupabaseAdmin();
@@ -221,10 +210,9 @@ projectsRouter.get("/:projectId/people", requireAuth, async (req, res) => {
     if (u) memberUserIds.push(u.id);
   }
 
-  const profileIds = [
-    project.userId as string,
-    ...memberUserIds,
-  ].filter((x, i, arr) => arr.indexOf(x) === i);
+  const profileIds = [project.userId as string, ...memberUserIds].filter(
+    (x, i, arr) => arr.indexOf(x) === i,
+  );
 
   const profileByUserId = new Map<
     string,
@@ -247,14 +235,11 @@ projectsRouter.get("/:projectId/people", requireAuth, async (req, res) => {
   const owner = {
     user_id: project.userId,
     email: ownerInfo?.email ?? null,
-    display_name:
-      profileByUserId.get(project.userId)?.displayName ?? null,
+    display_name: profileByUserId.get(project.userId)?.displayName ?? null,
   };
   const members = sharedWith.map((email) => {
     const u = userByEmail.get(email);
-    const display_name = u
-      ? profileByUserId.get(u.id)?.displayName ?? null
-      : null;
+    const display_name = u ? (profileByUserId.get(u.id)?.displayName ?? null) : null;
     return { email, display_name };
   });
 
@@ -279,9 +264,7 @@ projectsRouter.patch("/:projectId", requireAuth, async (req, res) => {
       const e = raw.trim().toLowerCase();
       if (!e || seen.has(e)) continue;
       if (normalizedUserEmail && e === normalizedUserEmail) {
-        return void res
-          .status(400)
-          .json({ detail: "You cannot share a project with yourself." });
+        return void res.status(400).json({ detail: "You cannot share a project with yourself." });
       }
       seen.add(e);
       cleaned.push(e);
@@ -293,8 +276,7 @@ projectsRouter.patch("/:projectId", requireAuth, async (req, res) => {
   const existing = await prisma.project.findFirst({
     where: { id: projectId, userId },
   });
-  if (!existing)
-    return void res.status(404).json({ detail: "Project not found" });
+  if (!existing) return void res.status(404).json({ detail: "Project not found" });
 
   const data = await prisma.project.update({
     where: { id: projectId },
@@ -334,8 +316,7 @@ projectsRouter.delete("/:projectId", requireAuth, async (req, res) => {
   const existing = await prisma.project.findFirst({
     where: { id: projectId, userId },
   });
-  if (!existing)
-    return void res.status(404).json({ detail: "Project not found" });
+  if (!existing) return void res.status(404).json({ detail: "Project not found" });
 
   await prisma.project.delete({ where: { id: projectId } });
 
@@ -356,8 +337,7 @@ projectsRouter.get("/:projectId/documents", requireAuth, async (req, res) => {
   const { projectId } = req.params;
 
   const access = await checkProjectAccess(projectId, userId, userEmail);
-  if (!access.ok)
-    return void res.status(404).json({ detail: "Project not found" });
+  if (!access.ok) return void res.status(404).json({ detail: "Project not found" });
 
   const docs = await prisma.document.findMany({
     where: { projectId },
@@ -372,118 +352,110 @@ projectsRouter.get("/:projectId/documents", requireAuth, async (req, res) => {
 });
 
 // POST /projects/:projectId/documents/:documentId — assign or copy existing doc into project
-projectsRouter.post(
-  "/:projectId/documents/:documentId",
-  requireAuth,
-  async (req, res) => {
-    const userId = res.locals.userId as string;
-    const userEmail = res.locals.userEmail as string | undefined;
-    const { projectId, documentId } = req.params;
+projectsRouter.post("/:projectId/documents/:documentId", requireAuth, async (req, res) => {
+  const userId = res.locals.userId as string;
+  const userEmail = res.locals.userEmail as string | undefined;
+  const { projectId, documentId } = req.params;
 
-    const access = await checkProjectAccess(projectId, userId, userEmail);
-    if (!access.ok)
-      return void res.status(404).json({ detail: "Project not found" });
+  const access = await checkProjectAccess(projectId, userId, userEmail);
+  if (!access.ok) return void res.status(404).json({ detail: "Project not found" });
 
-    // Adding-by-id pulls a doc into the project — only the doc's owner
-    // is allowed to do that, so other people's standalone docs can't be
-    // siphoned into a project the requester happens to share.
-    const doc = await prisma.document.findFirst({
-      where: { id: documentId, userId },
+  // Adding-by-id pulls a doc into the project — only the doc's owner
+  // is allowed to do that, so other people's standalone docs can't be
+  // siphoned into a project the requester happens to share.
+  const doc = await prisma.document.findFirst({
+    where: { id: documentId, userId },
+  });
+  if (!doc) return void res.status(404).json({ detail: "Document not found" });
+
+  // Already in this project — idempotent
+  if (doc.projectId === projectId) return void res.json(doc);
+
+  if (doc.projectId === null) {
+    // Standalone → assign project_id
+    const updated = await prisma.document.update({
+      where: { id: documentId },
+      data: { projectId },
     });
-    if (!doc)
-      return void res.status(404).json({ detail: "Document not found" });
+    return void res.json(updated);
+  } else {
+    // Belongs to another project → duplicate record AND copy the
+    // underlying storage objects so each project's copy is fully
+    // independent.
+    const copy = await prisma.document.create({
+      data: {
+        projectId,
+        userId,
+        filename: doc.filename,
+        fileType: doc.fileType,
+        sizeBytes: doc.sizeBytes,
+        pageCount: doc.pageCount,
+        structureTree: doc.structureTree ?? undefined,
+        status: doc.status,
+      },
+    });
 
-    // Already in this project — idempotent
-    if (doc.projectId === projectId) return void res.json(doc);
-
-    if (doc.projectId === null) {
-      // Standalone → assign project_id
-      const updated = await prisma.document.update({
-        where: { id: documentId },
-        data: { projectId },
-      });
-      return void res.json(updated);
-    } else {
-      // Belongs to another project → duplicate record AND copy the
-      // underlying storage objects so each project's copy is fully
-      // independent.
-      const copy = await prisma.document.create({
-        data: {
-          projectId,
-          userId,
-          filename: doc.filename,
-          fileType: doc.fileType,
-          sizeBytes: doc.sizeBytes,
-          pageCount: doc.pageCount,
-          structureTree: doc.structureTree ?? undefined,
-          status: doc.status,
+    let copyVersionRowId: string | null = null;
+    if (doc.currentVersionId) {
+      const srcV = await prisma.documentVersion.findUnique({
+        where: { id: doc.currentVersionId },
+        select: {
+          storagePath: true,
+          pdfStoragePath: true,
+          versionNumber: true,
+          displayName: true,
+          source: true,
         },
       });
+      if (srcV?.storagePath) {
+        const srcBytes = await downloadFile(srcV.storagePath);
+        if (!srcBytes) {
+          return void res.status(500).json({ detail: "Failed to read source document bytes" });
+        }
+        const newKey = storageKey(userId, copy.id, doc.filename);
+        const contentType =
+          doc.fileType === "pdf"
+            ? "application/pdf"
+            : "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+        await uploadFile(newKey, srcBytes, contentType);
 
-      let copyVersionRowId: string | null = null;
-      if (doc.currentVersionId) {
-        const srcV = await prisma.documentVersion.findUnique({
-          where: { id: doc.currentVersionId },
-          select: {
-            storagePath: true,
-            pdfStoragePath: true,
-            versionNumber: true,
-            displayName: true,
-            source: true,
-          },
-        });
-        if (srcV?.storagePath) {
-          const srcBytes = await downloadFile(srcV.storagePath);
-          if (!srcBytes) {
-            return void res
-              .status(500)
-              .json({ detail: "Failed to read source document bytes" });
-          }
-          const newKey = storageKey(userId, copy.id, doc.filename);
-          const contentType =
-            doc.fileType === "pdf"
-              ? "application/pdf"
-              : "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-          await uploadFile(newKey, srcBytes, contentType);
-
-          let newPdfPath: string | null = null;
-          if (srcV.pdfStoragePath) {
-            if (srcV.pdfStoragePath === srcV.storagePath) {
-              newPdfPath = newKey;
-            } else {
-              const pdfBytes = await downloadFile(srcV.pdfStoragePath);
-              if (pdfBytes) {
-                const newPdfKey = convertedPdfKey(userId, copy.id);
-                await uploadFile(newPdfKey, pdfBytes, "application/pdf");
-                newPdfPath = newPdfKey;
-              }
+        let newPdfPath: string | null = null;
+        if (srcV.pdfStoragePath) {
+          if (srcV.pdfStoragePath === srcV.storagePath) {
+            newPdfPath = newKey;
+          } else {
+            const pdfBytes = await downloadFile(srcV.pdfStoragePath);
+            if (pdfBytes) {
+              const newPdfKey = convertedPdfKey(userId, copy.id);
+              await uploadFile(newPdfKey, pdfBytes, "application/pdf");
+              newPdfPath = newPdfKey;
             }
           }
+        }
 
-          const newV = await prisma.documentVersion.create({
-            data: {
-              documentId: copy.id,
-              storagePath: newKey,
-              pdfStoragePath: newPdfPath,
-              source: srcV.source ?? "upload",
-              versionNumber: srcV.versionNumber ?? 1,
-              displayName: srcV.displayName ?? doc.filename,
-            },
-            select: { id: true },
+        const newV = await prisma.documentVersion.create({
+          data: {
+            documentId: copy.id,
+            storagePath: newKey,
+            pdfStoragePath: newPdfPath,
+            source: srcV.source ?? "upload",
+            versionNumber: srcV.versionNumber ?? 1,
+            displayName: srcV.displayName ?? doc.filename,
+          },
+          select: { id: true },
+        });
+        copyVersionRowId = newV.id;
+        if (copyVersionRowId) {
+          await prisma.document.update({
+            where: { id: copy.id },
+            data: { currentVersionId: copyVersionRowId },
           });
-          copyVersionRowId = newV.id;
-          if (copyVersionRowId) {
-            await prisma.document.update({
-              where: { id: copy.id },
-              data: { currentVersionId: copyVersionRowId },
-            });
-          }
         }
       }
-      return void res.status(201).json(copy);
     }
-  },
-);
+    return void res.status(201).json(copy);
+  }
+});
 
 // PATCH /projects/:projectId/documents/:documentId — rename a project document
 projectsRouter.patch("/:projectId/documents/:documentId", requireAuth, async (req, res) => {
@@ -492,19 +464,16 @@ projectsRouter.patch("/:projectId/documents/:documentId", requireAuth, async (re
   const { projectId, documentId } = req.params;
 
   const access = await checkProjectAccess(projectId, userId, userEmail);
-  if (!access.ok)
-    return void res.status(404).json({ detail: "Project not found" });
+  if (!access.ok) return void res.status(404).json({ detail: "Project not found" });
 
   const doc = await prisma.document.findFirst({
     where: { id: documentId, projectId },
     select: { id: true, filename: true, currentVersionId: true },
   });
-  if (!doc)
-    return void res.status(404).json({ detail: "Document not found" });
+  if (!doc) return void res.status(404).json({ detail: "Document not found" });
 
   const filename = normalizeDocumentFilename(req.body?.filename, doc.filename);
-  if (!filename)
-    return void res.status(400).json({ detail: "filename is required" });
+  if (!filename) return void res.status(400).json({ detail: "filename is required" });
 
   const updated = await prisma.document.update({
     where: { id: documentId },
@@ -532,8 +501,7 @@ projectsRouter.post(
     const { projectId } = req.params;
 
     const access = await checkProjectAccess(projectId, userId, userEmail);
-    if (!access.ok)
-      return void res.status(404).json({ detail: "Project not found" });
+    if (!access.ok) return void res.status(404).json({ detail: "Project not found" });
 
     await handleDocumentUpload(req, res, userId, projectId);
   },
@@ -546,8 +514,7 @@ projectsRouter.get("/:projectId/chats", requireAuth, async (req, res) => {
   const { projectId } = req.params;
 
   const access = await checkProjectAccess(projectId, userId, userEmail);
-  if (!access.ok)
-    return void res.status(404).json({ detail: "Project not found" });
+  if (!access.ok) return void res.status(404).json({ detail: "Project not found" });
 
   const chats = await prisma.chat.findMany({
     where: { projectId },
@@ -616,7 +583,10 @@ projectsRouter.patch("/:projectId/folders/:folderId", requireAuth, async (req, r
 
       let cur: string | null = body.parent_folder_id;
       while (cur) {
-        if (cur === folderId) return void res.status(400).json({ detail: "Cannot move a folder into itself or a descendant" });
+        if (cur === folderId)
+          return void res
+            .status(400)
+            .json({ detail: "Cannot move a folder into itself or a descendant" });
         const p = await loadProjectFolder(projectId, cur);
         if (!p) return void res.status(404).json({ detail: "Parent folder not found" });
         cur = p?.parentFolderId ?? null;
@@ -717,15 +687,11 @@ export async function handleDocumentUpload(
   if (!file) return void res.status(400).json({ detail: "file is required" });
 
   const filename = file.originalname;
-  const suffix = filename.includes(".")
-    ? filename.split(".").pop()!.toLowerCase()
-    : "";
+  const suffix = filename.includes(".") ? filename.split(".").pop()!.toLowerCase() : "";
   if (!ALLOWED_TYPES.has(suffix))
-    return void res
-      .status(400)
-      .json({
-        detail: `Unsupported file type: ${suffix}. Allowed: pdf, docx, doc`,
-      });
+    return void res.status(400).json({
+      detail: `Unsupported file type: ${suffix}. Allowed: pdf, docx, doc`,
+    });
 
   const content = file.buffer;
   const doc = await prisma.document.create({
@@ -814,9 +780,9 @@ export async function handleDocumentUpload(
     });
     const responseDoc = updated
       ? {
-            ...updated,
-            storage_path: key,
-            pdf_storage_path: pdfStoragePath,
+          ...updated,
+          storage_path: key,
+          pdf_storage_path: pdfStoragePath,
         }
       : updated;
     return void res.status(201).json(responseDoc);
@@ -825,9 +791,7 @@ export async function handleDocumentUpload(
       where: { id: doc.id },
       data: { status: "failed" as any },
     });
-    return void res
-      .status(500)
-      .json({ detail: `Document processing failed: ${String(e)}` });
+    return void res.status(500).json({ detail: `Document processing failed: ${String(e)}` });
   }
 }
 
@@ -854,9 +818,7 @@ async function extractStructureTree(
 ): Promise<unknown[] | null> {
   try {
     if (fileType === "pdf") {
-      const pdfjsLib = await import(
-        "pdfjs-dist/legacy/build/pdf.mjs" as string
-      );
+      const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs" as string);
       const pdf = await (
         pdfjsLib as unknown as {
           getDocument: (opts: unknown) => {
@@ -891,15 +853,13 @@ async function extractStructureTree(
         buffer: Buffer.from(content),
       });
       const lines = result.value.split("\n").filter((l) => l.trim());
-      const nodes = lines
-        .slice(0, 30)
-        .map((line, i) => ({
-          id: `h1-${i}`,
-          title: line.slice(0, 100),
-          level: 1,
-          page_number: null,
-          children: [],
-        }));
+      const nodes = lines.slice(0, 30).map((line, i) => ({
+        id: `h1-${i}`,
+        title: line.slice(0, 100),
+        level: 1,
+        page_number: null,
+        children: [],
+      }));
       return nodes.length ? nodes : null;
     }
   } catch {

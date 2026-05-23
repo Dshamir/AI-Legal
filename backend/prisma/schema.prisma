@@ -91,6 +91,7 @@ model UserApiKey {
   encryptedKey String         @map("encrypted_key")
   iv           String
   authTag      String         @map("auth_tag")
+  salt         String?
   createdAt    DateTime       @default(now()) @map("created_at") @db.Timestamptz
   updatedAt    DateTime       @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
 
