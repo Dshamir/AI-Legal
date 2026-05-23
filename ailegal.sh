@@ -13,8 +13,8 @@ SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0
 ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 cd "$ROOT"
 
-COMPOSE="docker compose"
 PROJECT_NAME="mike"
+COMPOSE="docker compose -p ${PROJECT_NAME}"
 BACKUP_DIR="${ROOT}/backups"
 PORTS_FILE="${ROOT}/.ports"
 ENV_FILE="${ROOT}/.env"
@@ -123,6 +123,13 @@ find_free_port() {
   return 1
 }
 
+port_held_by_our_service() {
+  local port="$1" service="$2"
+  local holder
+  holder=$(docker ps --filter "publish=$port" --format '{{.Names}}' 2>/dev/null | head -1)
+  [[ "$holder" == *"-${service}-"* ]]
+}
+
 ensure_dynamic_ports() {
   load_ports
   local conflicts=0
@@ -132,10 +139,7 @@ ensure_dynamic_ports() {
     local label="${PORT_LABELS[$i]}"
     local service="${PORT_SERVICES[$i]}"
     if ! is_port_free "$port"; then
-      local container_name="${PROJECT_NAME}-${service}-1"
-      local holder
-      holder=$(docker inspect --format='{{.Name}}' "$container_name" 2>/dev/null || echo "")
-      if [ -n "$holder" ]; then
+      if port_held_by_our_service "$port" "$service"; then
         continue
       fi
       log_warn "Port $port ($label) is in use — finding alternative..."
@@ -168,10 +172,7 @@ cmd_ports() {
     local status_color="$GREEN"
     local status_text="free"
     if ! is_port_free "$port"; then
-      local container_name="${PROJECT_NAME}-${service}-1"
-      local holder
-      holder=$(docker inspect --format='{{.Name}}' "$container_name" 2>/dev/null || echo "")
-      if [ -n "$holder" ]; then
+      if port_held_by_our_service "$port" "$service"; then
         status_text="ours"
         status_color="$GREEN"
       else
