@@ -2,6 +2,7 @@ import crypto from "crypto";
 import { prisma } from "./prisma";
 import type { UserApiKeys } from "./llm";
 import { logger } from "./logger";
+import { currentEncryptionKey, tryDecrypt } from "./keyRotation";
 
 export type ApiKeyProvider = "claude" | "gemini" | "openai";
 export type ApiKeySource = "user" | "env" | null;
@@ -37,11 +38,7 @@ export function hasEnvApiKey(provider: ApiKeyProvider): boolean {
 }
 
 function encryptionKey(): Buffer {
-    const secret = process.env.USER_API_KEYS_ENCRYPTION_SECRET;
-    if (!secret) {
-        throw new Error("USER_API_KEYS_ENCRYPTION_SECRET is not configured");
-    }
-    return crypto.createHash("sha256").update(secret).digest();
+    return currentEncryptionKey();
 }
 
 function encrypt(value: string): { encryptedKey: string; iv: string; authTag: string } {
@@ -59,22 +56,11 @@ function encrypt(value: string): { encryptedKey: string; iv: string; authTag: st
 }
 
 function decrypt(row: EncryptedKeyRow): string | null {
-    try {
-        const decipher = crypto.createDecipheriv(
-            "aes-256-gcm",
-            encryptionKey(),
-            Buffer.from(row.iv, "base64"),
-        );
-        decipher.setAuthTag(Buffer.from(row.authTag, "base64"));
-        const decrypted = Buffer.concat([
-            decipher.update(Buffer.from(row.encryptedKey, "base64")),
-            decipher.final(),
-        ]);
-        return decrypted.toString("utf8");
-    } catch (err) {
-        logger.error({ provider: row.provider, err }, "[user-api-keys] failed to decrypt stored key");
-        return null;
+    const result = tryDecrypt(row.encryptedKey, row.iv, row.authTag);
+    if (result === null) {
+        logger.error({ provider: row.provider }, "[user-api-keys] failed to decrypt stored key");
     }
+    return result;
 }
 
 function isProvider(value: string): value is ApiKeyProvider {
