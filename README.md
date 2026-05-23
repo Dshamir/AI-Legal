@@ -157,12 +157,53 @@ Pre-commit hooks (Husky + lint-staged) auto-format staged files with Prettier.
 ## Architecture
 
 ```
-nginx (:80) ─── reverse proxy
-  ├── / ──────── frontend (:3000)   Next.js 16 + React 19
-  ├── /api/ ──── backend (:3001)    Express + Prisma + Pino
-  ├── /rest/ ─── postgrest (:3002)  Auto REST API
-  ├── /pgadmin/  pgadmin (:5050)    DB admin
-  └── /glitchtip glitchtip (:8000)  Error tracking
+┌─────────────────────────────────────────────────────────────────┐
+│                        nginx (:80)                              │
+│                     reverse proxy + rate limiting                │
+├─────────┬──────────┬───────────┬────────────┬───────────────────┤
+│  /      │  /api/   │  /rest/   │  /pgadmin/ │  /glitchtip/      │
+│    │    │    │     │     │     │      │     │       │            │
+│    ▼    │    ▼     │     ▼     │      ▼     │       ▼            │
+│ frontend│ backend  │ postgrest │   pgadmin  │   glitchtip       │
+│ (:3000) │ (:3001)  │ (:3002)   │   (:5050)  │   (:8000)         │
+│         │          │           │            │       │            │
+│ Next.js │ Express  │ Auto REST │  DB Admin  │   Error Tracking  │
+│ React19 │ Prisma   │    API    │    GUI     │       │            │
+│ Tailwind│ Zod,Pino │           │            │   glitchtip-worker│
+└─────────┴────┬─────┴─────┬─────┴──────┬─────┴───────┬───────────┘
+               │           │            │             │
+        ┌──────┴───────────┴────────────┴─────────────┘
+        │
+        ▼
+┌───────────────────────────────────────────────────────────────┐
+│                      Data Layer                               │
+│                                                               │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐    │
+│  │  postgres     │  │    redis     │  │      minio       │    │
+│  │  (:5432)      │  │   (:6379)    │  │  (:9000/:9001)   │    │
+│  │              │  │              │  │                  │    │
+│  │ PostgreSQL 16 │  │   Cache &    │  │  S3-compatible   │    │
+│  │ Prisma ORM    │  │   Sessions   │  │  Object Storage  │    │
+│  │ 17 models     │  │              │  │  Documents, PDFs │    │
+│  │ Soft-delete   │  │              │  │                  │    │
+│  │ Audit trail   │  │              │  │                  │    │
+│  └──────────────┘  └──────────────┘  └──────────────────┘    │
+│                                                               │
+│  ┌──────────────┐                                             │
+│  │   gotrue      │                                             │
+│  │  (:9999)      │                                             │
+│  │              │                                             │
+│  │ JWT Auth      │                                             │
+│  │ Supabase-     │                                             │
+│  │ compatible    │                                             │
+│  └──────────────┘                                             │
+└───────────────────────────────────────────────────────────────┘
+
+LLM Providers (external APIs):
+  ┌────────────┐  ┌────────────┐  ┌────────────┐
+  │  Anthropic  │  │   Google   │  │   OpenAI   │
+  │   Claude    │  │   Gemini   │  │  GPT/o-ser │
+  └────────────┘  └────────────┘  └────────────┘
 ```
 
 **Backend stack**: Express, Prisma ORM, Zod validation, Pino structured logging, Helmet (CSP), rate limiting, HMAC-signed downloads, AES-256 encrypted user API keys with key rotation, magic-byte MIME file validation.
