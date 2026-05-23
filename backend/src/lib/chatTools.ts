@@ -1,81 +1,64 @@
 import path from "path";
+import { sanitizeLlmInput } from "./sanitize";
 import { logger } from "./logger";
-import {
-    downloadFile,
-    generatedDocKey,
-    storageKey,
-    uploadFile,
-} from "./storage";
+import { downloadFile, generatedDocKey, storageKey, uploadFile } from "./storage";
 import { convertedPdfKey } from "./convert";
 import { prisma } from "./prisma";
-import {
-    applyTrackedEdits,
-    extractDocxBodyText,
-    type EditInput,
-} from "./docxTrackedChanges";
+import { applyTrackedEdits, extractDocxBodyText, type EditInput } from "./docxTrackedChanges";
 import { buildDownloadUrl } from "./downloadTokens";
+import { attachActiveVersionPaths, loadActiveVersion } from "./documentVersions";
 import {
-    attachActiveVersionPaths,
-    loadActiveVersion,
-} from "./documentVersions";
-import {
-    streamChatWithTools,
-    resolveModel,
-    DEFAULT_MAIN_MODEL,
-    type LlmMessage,
-    type OpenAIToolSchema,
+  streamChatWithTools,
+  resolveModel,
+  DEFAULT_MAIN_MODEL,
+  type LlmMessage,
+  type OpenAIToolSchema,
 } from "./llm";
 
 const STANDARD_FONT_DATA_URL = (() => {
-    try {
-        const pkgPath = require.resolve("pdfjs-dist/package.json");
-        return path.join(path.dirname(pkgPath), "standard_fonts") + path.sep;
-    } catch {
-        return undefined;
-    }
+  try {
+    const pkgPath = require.resolve("pdfjs-dist/package.json");
+    return path.join(path.dirname(pkgPath), "standard_fonts") + path.sep;
+  } catch {
+    return undefined;
+  }
 })();
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-export type DocStore = Map<
-    string,
-    { storage_path: string; file_type: string; filename: string }
->;
+export type DocStore = Map<string, { storage_path: string; file_type: string; filename: string }>;
 
 export type WorkflowStore = Map<string, { title: string; prompt_md: string }>;
 
 export type DocIndex = Record<
-    string,
-    {
-        document_id: string;
-        filename: string;
-        version_id?: string | null;
-        version_number?: number | null;
-    }
+  string,
+  {
+    document_id: string;
+    filename: string;
+    version_id?: string | null;
+    version_number?: number | null;
+  }
 >;
 
 export type TabularCellStore = {
-    columns: { index: number; name: string }[];
-    documents: { id: string; filename: string }[];
-    /** key: `${colIndex}:${docId}` */
-    cells: Map<
-        string,
-        { summary: string; flag?: string; reasoning?: string } | null
-    >;
+  columns: { index: number; name: string }[];
+  documents: { id: string; filename: string }[];
+  /** key: `${colIndex}:${docId}` */
+  cells: Map<string, { summary: string; flag?: string; reasoning?: string } | null>;
 };
 
 export type ToolCall = {
-    id: string;
-    function: { name: string; arguments: string };
+  id: string;
+  function: { name: string; arguments: string };
 };
 
 export type ChatMessage = {
-    role: string;
-    content: string | null;
-    files?: { filename: string; document_id?: string }[];
-    workflow?: { id: string; title: string };
+  role: string;
+  content: string | null;
+  files?: { filename: string; document_id?: string }[];
+  workflow?: { id: string; title: string };
 };
 
 // ---------------------------------------------------------------------------
@@ -143,348 +126,321 @@ GENERAL GUIDANCE:
 `;
 
 export const PROJECT_EXTRA_TOOLS = [
-    {
-        type: "function",
-        function: {
-            name: "list_documents",
-            description:
-                "List all documents available in the project. Returns each document's ID, filename, and file type. Call this to discover what documents are available before deciding which ones to read.",
-            parameters: { type: "object", properties: {} },
-        },
+  {
+    type: "function",
+    function: {
+      name: "list_documents",
+      description:
+        "List all documents available in the project. Returns each document's ID, filename, and file type. Call this to discover what documents are available before deciding which ones to read.",
+      parameters: { type: "object", properties: {} },
     },
-    {
-        type: "function",
-        function: {
-            name: "fetch_documents",
-            description:
-                "Read the full text content of multiple documents in a single call. Use this instead of calling read_document repeatedly when you need to read several documents at once.",
-            parameters: {
-                type: "object",
-                properties: {
-                    doc_ids: {
-                        type: "array",
-                        items: { type: "string" },
-                        description:
-                            "Array of document IDs to read (e.g. ['doc-0', 'doc-2'])",
-                    },
-                },
-                required: ["doc_ids"],
-            },
+  },
+  {
+    type: "function",
+    function: {
+      name: "fetch_documents",
+      description:
+        "Read the full text content of multiple documents in a single call. Use this instead of calling read_document repeatedly when you need to read several documents at once.",
+      parameters: {
+        type: "object",
+        properties: {
+          doc_ids: {
+            type: "array",
+            items: { type: "string" },
+            description: "Array of document IDs to read (e.g. ['doc-0', 'doc-2'])",
+          },
         },
+        required: ["doc_ids"],
+      },
     },
-    {
-        type: "function",
-        function: {
-            name: "replicate_document",
+  },
+  {
+    type: "function",
+    function: {
+      name: "replicate_document",
+      description:
+        "Make byte-for-byte copies of an existing project document as new project documents. Use when the user wants standalone copies to edit (e.g. 'use this NDA as a template', 'give me three drafts I can adapt') without modifying the original. Pass `count` to create multiple copies in a single call rather than calling the tool repeatedly. Returns the new doc_id slugs so you can immediately call edit_document / read_document on them.",
+      parameters: {
+        type: "object",
+        properties: {
+          doc_id: {
+            type: "string",
+            description: "ID of the source document to copy (e.g. 'doc-0').",
+          },
+          count: {
+            type: "integer",
+            description: "How many copies to create. Defaults to 1. Maximum 20.",
+            minimum: 1,
+            maximum: 20,
+          },
+          new_filename: {
+            type: "string",
             description:
-                "Make byte-for-byte copies of an existing project document as new project documents. Use when the user wants standalone copies to edit (e.g. 'use this NDA as a template', 'give me three drafts I can adapt') without modifying the original. Pass `count` to create multiple copies in a single call rather than calling the tool repeatedly. Returns the new doc_id slugs so you can immediately call edit_document / read_document on them.",
-            parameters: {
-                type: "object",
-                properties: {
-                    doc_id: {
-                        type: "string",
-                        description:
-                            "ID of the source document to copy (e.g. 'doc-0').",
-                    },
-                    count: {
-                        type: "integer",
-                        description:
-                            "How many copies to create. Defaults to 1. Maximum 20.",
-                        minimum: 1,
-                        maximum: 20,
-                    },
-                    new_filename: {
-                        type: "string",
-                        description:
-                            "Optional base filename. With count > 1, copies are suffixed (e.g. 'Foo (1).docx', 'Foo (2).docx'). Extension is forced to match the source.",
-                    },
-                },
-                required: ["doc_id"],
-            },
+              "Optional base filename. With count > 1, copies are suffixed (e.g. 'Foo (1).docx', 'Foo (2).docx'). Extension is forced to match the source.",
+          },
         },
+        required: ["doc_id"],
+      },
     },
+  },
 ];
 
 export const TABULAR_TOOLS = [
-    {
-        type: "function",
-        function: {
-            name: "read_table_cells",
+  {
+    type: "function",
+    function: {
+      name: "read_table_cells",
+      description:
+        "Read the extracted cell content from the tabular review. Each cell contains the value extracted for a specific column from a specific document. Pass col_indices and/or row_indices (0-based) to read a subset; omit either to read all columns or all rows.",
+      parameters: {
+        type: "object",
+        properties: {
+          col_indices: {
+            type: "array",
+            items: { type: "integer" },
+            description: "0-based column indices to read (e.g. [0, 2]). Omit to read all columns.",
+          },
+          row_indices: {
+            type: "array",
+            items: { type: "integer" },
             description:
-                "Read the extracted cell content from the tabular review. Each cell contains the value extracted for a specific column from a specific document. Pass col_indices and/or row_indices (0-based) to read a subset; omit either to read all columns or all rows.",
-            parameters: {
-                type: "object",
-                properties: {
-                    col_indices: {
-                        type: "array",
-                        items: { type: "integer" },
-                        description:
-                            "0-based column indices to read (e.g. [0, 2]). Omit to read all columns.",
-                    },
-                    row_indices: {
-                        type: "array",
-                        items: { type: "integer" },
-                        description:
-                            "0-based document (row) indices to read (e.g. [0, 1]). Omit to read all rows.",
-                    },
-                },
-            },
+              "0-based document (row) indices to read (e.g. [0, 1]). Omit to read all rows.",
+          },
         },
+      },
     },
+  },
 ];
 
 export const WORKFLOW_TOOLS = [
-    {
-        type: "function",
-        function: {
-            name: "list_workflows",
-            description:
-                "List all workflows available to the user. Returns each workflow's ID and title. Call this when the user asks to run a workflow, apply a template, or you need to discover what workflows exist.",
-            parameters: { type: "object", properties: {} },
-        },
+  {
+    type: "function",
+    function: {
+      name: "list_workflows",
+      description:
+        "List all workflows available to the user. Returns each workflow's ID and title. Call this when the user asks to run a workflow, apply a template, or you need to discover what workflows exist.",
+      parameters: { type: "object", properties: {} },
     },
-    {
-        type: "function",
-        function: {
-            name: "read_workflow",
-            description:
-                "Read the full instructions (prompt) of a workflow by its ID. Call this after list_workflows to load a specific workflow's prompt, then follow those instructions.",
-            parameters: {
-                type: "object",
-                properties: {
-                    workflow_id: {
-                        type: "string",
-                        description: "The workflow ID to read",
-                    },
-                },
-                required: ["workflow_id"],
-            },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_workflow",
+      description:
+        "Read the full instructions (prompt) of a workflow by its ID. Call this after list_workflows to load a specific workflow's prompt, then follow those instructions.",
+      parameters: {
+        type: "object",
+        properties: {
+          workflow_id: {
+            type: "string",
+            description: "The workflow ID to read",
+          },
         },
+        required: ["workflow_id"],
+      },
     },
+  },
 ];
 
 export const TOOLS = [
-    {
-        type: "function",
-        function: {
-            name: "read_document",
-            description:
-                "Read the full text content of a document attached by the user. Always call this before answering questions about, summarising, or citing from a document.",
-            parameters: {
-                type: "object",
-                properties: {
-                    doc_id: {
-                        type: "string",
-                        description:
-                            "The document ID to read (e.g. 'doc-0', 'doc-1')",
-                    },
-                },
-                required: ["doc_id"],
-            },
+  {
+    type: "function",
+    function: {
+      name: "read_document",
+      description:
+        "Read the full text content of a document attached by the user. Always call this before answering questions about, summarising, or citing from a document.",
+      parameters: {
+        type: "object",
+        properties: {
+          doc_id: {
+            type: "string",
+            description: "The document ID to read (e.g. 'doc-0', 'doc-1')",
+          },
         },
+        required: ["doc_id"],
+      },
     },
-    {
-        type: "function",
-        function: {
-            name: "find_in_document",
+  },
+  {
+    type: "function",
+    function: {
+      name: "find_in_document",
+      description:
+        "Search for specific strings inside a document — a Ctrl+F equivalent. Returns each match with surrounding context so you can locate and quote the exact text without reading the whole document. Matching is case-insensitive and whitespace-tolerant. Use this for targeted lookups (e.g. finding a clause title, party name, or a specific phrase) rather than reading the whole document.",
+      parameters: {
+        type: "object",
+        properties: {
+          doc_id: {
+            type: "string",
+            description: "The document ID to search (e.g. 'doc-0').",
+          },
+          query: {
+            type: "string",
             description:
-                "Search for specific strings inside a document — a Ctrl+F equivalent. Returns each match with surrounding context so you can locate and quote the exact text without reading the whole document. Matching is case-insensitive and whitespace-tolerant. Use this for targeted lookups (e.g. finding a clause title, party name, or a specific phrase) rather than reading the whole document.",
-            parameters: {
-                type: "object",
-                properties: {
-                    doc_id: {
-                        type: "string",
-                        description:
-                            "The document ID to search (e.g. 'doc-0').",
-                    },
-                    query: {
-                        type: "string",
-                        description:
-                            "The string to search for. Matching is case-insensitive and collapses runs of whitespace, so 'Section 4.2' matches 'section   4.2'.",
-                    },
-                    max_results: {
-                        type: "integer",
-                        description:
-                            "Maximum number of matches to return (default 20). Use a smaller value for common terms.",
-                    },
-                    context_chars: {
-                        type: "integer",
-                        description:
-                            "Characters of surrounding context to include on each side of a match (default 80).",
-                    },
-                },
-                required: ["doc_id", "query"],
-            },
+              "The string to search for. Matching is case-insensitive and collapses runs of whitespace, so 'Section 4.2' matches 'section   4.2'.",
+          },
+          max_results: {
+            type: "integer",
+            description:
+              "Maximum number of matches to return (default 20). Use a smaller value for common terms.",
+          },
+          context_chars: {
+            type: "integer",
+            description:
+              "Characters of surrounding context to include on each side of a match (default 80).",
+          },
         },
+        required: ["doc_id", "query"],
+      },
     },
-    {
-        type: "function",
-        function: {
-            name: "generate_docx",
+  },
+  {
+    type: "function",
+    function: {
+      name: "generate_docx",
+      description:
+        "Generate a Word (.docx) document from structured content. Use this when the user asks you to draft, create, or produce a legal document. Returns a download URL for the generated file.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: {
+            type: "string",
+            description: "Document title (used as filename and heading)",
+          },
+          landscape: {
+            type: "boolean",
+            description: "Set to true for landscape page orientation. Default is portrait.",
+          },
+          sections: {
+            type: "array",
             description:
-                "Generate a Word (.docx) document from structured content. Use this when the user asks you to draft, create, or produce a legal document. Returns a download URL for the generated file.",
-            parameters: {
-                type: "object",
-                properties: {
-                    title: {
-                        type: "string",
-                        description:
-                            "Document title (used as filename and heading)",
+              "List of document sections. Each section may contain a heading, prose content, or a table.",
+            items: {
+              type: "object",
+              properties: {
+                heading: {
+                  type: "string",
+                  description: "Optional section heading",
+                },
+                level: {
+                  type: "integer",
+                  description: "Heading level: 1, 2, or 3",
+                },
+                content: {
+                  type: "string",
+                  description: "Prose text content (paragraphs separated by double newlines)",
+                },
+                pageBreak: {
+                  type: "boolean",
+                  description:
+                    "Set to true to start this section on a new page. Use for contract signature pages.",
+                },
+                table: {
+                  type: "object",
+                  description: "Optional table to render in this section",
+                  properties: {
+                    headers: {
+                      type: "array",
+                      items: { type: "string" },
+                      description: "Column header labels",
                     },
-                    landscape: {
-                        type: "boolean",
-                        description:
-                            "Set to true for landscape page orientation. Default is portrait.",
-                    },
-                    sections: {
+                    rows: {
+                      type: "array",
+                      items: {
                         type: "array",
-                        description:
-                            "List of document sections. Each section may contain a heading, prose content, or a table.",
-                        items: {
-                            type: "object",
-                            properties: {
-                                heading: {
-                                    type: "string",
-                                    description: "Optional section heading",
-                                },
-                                level: {
-                                    type: "integer",
-                                    description: "Heading level: 1, 2, or 3",
-                                },
-                                content: {
-                                    type: "string",
-                                    description:
-                                        "Prose text content (paragraphs separated by double newlines)",
-                                },
-                                pageBreak: {
-                                    type: "boolean",
-                                    description:
-                                        "Set to true to start this section on a new page. Use for contract signature pages.",
-                                },
-                                table: {
-                                    type: "object",
-                                    description:
-                                        "Optional table to render in this section",
-                                    properties: {
-                                        headers: {
-                                            type: "array",
-                                            items: { type: "string" },
-                                            description: "Column header labels",
-                                        },
-                                        rows: {
-                                            type: "array",
-                                            items: {
-                                                type: "array",
-                                                items: { type: "string" },
-                                            },
-                                            description:
-                                                "Array of rows, each row is an array of cell strings matching the headers order",
-                                        },
-                                    },
-                                    required: ["headers", "rows"],
-                                },
-                            },
-                        },
+                        items: { type: "string" },
+                      },
+                      description:
+                        "Array of rows, each row is an array of cell strings matching the headers order",
                     },
+                  },
+                  required: ["headers", "rows"],
                 },
-                required: ["title", "sections"],
+              },
             },
+          },
         },
+        required: ["title", "sections"],
+      },
     },
-    {
-        type: "function",
-        function: {
-            name: "edit_document",
-            description:
-                "Propose edits to a user-attached .docx as tracked changes. Each edit is a precise, minimal substitution of specific words/characters, NOT a whole-line or paragraph replacement. Use read_document first. Anchor each edit with short before/after context so it can be located unambiguously. Returns per-edit annotations the UI will render as Accept/Reject cards and a download link to the edited document.",
-            parameters: {
-                type: "object",
-                properties: {
-                    doc_id: {
-                        type: "string",
-                        description: "Document slug (e.g. 'doc-0').",
-                    },
-                    edits: {
-                        type: "array",
-                        description: "List of precise substitutions.",
-                        items: {
-                            type: "object",
-                            properties: {
-                                find: {
-                                    type: "string",
-                                    description:
-                                        "Exact substring to replace (keep it as short as possible — ideally just the words/chars being changed).",
-                                },
-                                replace: {
-                                    type: "string",
-                                    description:
-                                        "Replacement text. Empty string = pure deletion.",
-                                },
-                                context_before: {
-                                    type: "string",
-                                    description:
-                                        "~40 chars immediately preceding `find`, used to disambiguate.",
-                                },
-                                context_after: {
-                                    type: "string",
-                                    description:
-                                        "~40 chars immediately following `find`.",
-                                },
-                                reason: {
-                                    type: "string",
-                                    description:
-                                        "Short explanation shown to the user on the card.",
-                                },
-                            },
-                            required: [
-                                "find",
-                                "replace",
-                                "context_before",
-                                "context_after",
-                            ],
-                        },
-                    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "edit_document",
+      description:
+        "Propose edits to a user-attached .docx as tracked changes. Each edit is a precise, minimal substitution of specific words/characters, NOT a whole-line or paragraph replacement. Use read_document first. Anchor each edit with short before/after context so it can be located unambiguously. Returns per-edit annotations the UI will render as Accept/Reject cards and a download link to the edited document.",
+      parameters: {
+        type: "object",
+        properties: {
+          doc_id: {
+            type: "string",
+            description: "Document slug (e.g. 'doc-0').",
+          },
+          edits: {
+            type: "array",
+            description: "List of precise substitutions.",
+            items: {
+              type: "object",
+              properties: {
+                find: {
+                  type: "string",
+                  description:
+                    "Exact substring to replace (keep it as short as possible — ideally just the words/chars being changed).",
                 },
-                required: ["doc_id", "edits"],
+                replace: {
+                  type: "string",
+                  description: "Replacement text. Empty string = pure deletion.",
+                },
+                context_before: {
+                  type: "string",
+                  description: "~40 chars immediately preceding `find`, used to disambiguate.",
+                },
+                context_after: {
+                  type: "string",
+                  description: "~40 chars immediately following `find`.",
+                },
+                reason: {
+                  type: "string",
+                  description: "Short explanation shown to the user on the card.",
+                },
+              },
+              required: ["find", "replace", "context_before", "context_after"],
             },
+          },
         },
+        required: ["doc_id", "edits"],
+      },
     },
+  },
 ];
 
 type ParsedCitation = {
-    ref: number;
-    doc_id: string;
-    page: number | string;
-    quote: string;
+  ref: number;
+  doc_id: string;
+  page: number | string;
+  quote: string;
 };
 
 function normalizeCitation(raw: unknown): ParsedCitation | null {
-    if (!raw || typeof raw !== "object") return null;
-    const c = raw as Record<string, unknown>;
-    const markerRef =
-        typeof c.marker === "string"
-            ? Number(c.marker.match(/^\[(\d+)\]$/)?.[1])
-            : NaN;
-    const ref =
-        typeof c.ref === "number"
-            ? c.ref
-            : Number.isFinite(markerRef)
-              ? markerRef
-              : null;
-    if (typeof ref !== "number" || typeof c.doc_id !== "string") return null;
-    const quote = typeof c.quote === "string" ? c.quote : c.text;
-    if (typeof quote !== "string" || !quote) return null;
-    let page: number | string;
-    if (typeof c.page === "number") {
-        page = c.page;
-    } else if (typeof c.page === "string" && /^\d+\s*-\s*\d+$/.test(c.page)) {
-        page = c.page;
-    } else {
-        const n = parseInt(String(c.page ?? ""), 10);
-        if (!Number.isFinite(n)) page = 1;
-        else page = n;
-    }
-    return { ref, doc_id: c.doc_id, page, quote };
+  if (!raw || typeof raw !== "object") return null;
+  const c = raw as Record<string, unknown>;
+  const markerRef = typeof c.marker === "string" ? Number(c.marker.match(/^\[(\d+)\]$/)?.[1]) : NaN;
+  const ref = typeof c.ref === "number" ? c.ref : Number.isFinite(markerRef) ? markerRef : null;
+  if (typeof ref !== "number" || typeof c.doc_id !== "string") return null;
+  const quote = typeof c.quote === "string" ? c.quote : c.text;
+  if (typeof quote !== "string" || !quote) return null;
+  let page: number | string;
+  if (typeof c.page === "number") {
+    page = c.page;
+  } else if (typeof c.page === "string" && /^\d+\s*-\s*\d+$/.test(c.page)) {
+    page = c.page;
+  } else {
+    const n = parseInt(String(c.page ?? ""), 10);
+    if (!Number.isFinite(n)) page = 1;
+    else page = n;
+  }
+  return { ref, doc_id: c.doc_id, page, quote };
 }
 
 // ---------------------------------------------------------------------------
@@ -492,7 +448,7 @@ function normalizeCitation(raw: unknown): ParsedCitation | null {
 // ---------------------------------------------------------------------------
 
 export function resolveDoc(rawId: string, docIndex: DocIndex) {
-    return docIndex[rawId];
+  return docIndex[rawId];
 }
 
 /**
@@ -503,30 +459,30 @@ export function resolveDoc(rawId: string, docIndex: DocIndex) {
  * silently returns "not found" and the model gives up and re-generates.
  */
 export function resolveDocLabel(
-    rawId: string,
-    docStore: DocStore,
-    docIndex?: DocIndex,
+  rawId: string,
+  docStore: DocStore,
+  docIndex?: DocIndex,
 ): string | null {
-    if (docStore.has(rawId)) return rawId;
-    for (const [label, info] of docStore.entries()) {
-        if (info.filename === rawId) return label;
+  if (docStore.has(rawId)) return rawId;
+  for (const [label, info] of docStore.entries()) {
+    if (info.filename === rawId) return label;
+  }
+  if (docIndex) {
+    for (const [label, info] of Object.entries(docIndex)) {
+      if (info.document_id === rawId) return label;
     }
-    if (docIndex) {
-        for (const [label, info] of Object.entries(docIndex)) {
-            if (info.document_id === rawId) return label;
-        }
-    }
-    return null;
+  }
+  return null;
 }
 
 function citationReminder(docLabel: string, filename: string): string {
-    return [
-        `[Citation requirement for ${docLabel} ("${filename}")]:`,
-        `If your final answer makes any factual claim from this document, include inline [N] markers and append a final <CITATIONS> JSON block.`,
-        `Every citation entry for this document MUST use "doc_id": "${docLabel}".`,
-        `Use this exact citation object shape: {"ref": 1, "doc_id": "${docLabel}", "page": 1, "quote": "exact verbatim text from the document"}.`,
-        `Do not use "marker" or "text" keys in the citation block; use "ref" and "quote".`,
-    ].join("\n");
+  return [
+    `[Citation requirement for ${docLabel} ("${sanitizeLlmInput(filename)}")]:`,
+    `If your final answer makes any factual claim from this document, include inline [N] markers and append a final <CITATIONS> JSON block.`,
+    `Every citation entry for this document MUST use "doc_id": "${docLabel}".`,
+    `Use this exact citation object shape: {"ref": 1, "doc_id": "${docLabel}", "page": 1, "quote": "exact verbatim text from the document"}.`,
+    `Do not use "marker" or "text" keys in the citation block; use "ref" and "quote".`,
+  ].join("\n");
 }
 
 /**
@@ -543,690 +499,635 @@ function citationReminder(docLabel: string, filename: string): string {
  * only if the doc is no longer in the index (deleted, scope changed).
  */
 export async function enrichWithPriorEvents(
-    messages: ChatMessage[],
-    chatId: string | null | undefined,
-    docIndex: DocIndex,
+  messages: ChatMessage[],
+  chatId: string | null | undefined,
+  docIndex: DocIndex,
 ): Promise<ChatMessage[]> {
-    if (!chatId) return messages;
-    const rows = await prisma.chatMessage.findMany({
-        where: { chatId, role: "assistant" },
-        select: { content: true, createdAt: true },
-        orderBy: { createdAt: "desc" },
-        take: 1,
-    });
+  if (!chatId) return messages;
+  const rows = await prisma.chatMessage.findMany({
+    where: { chatId, role: "assistant" },
+    select: { content: true, createdAt: true },
+    orderBy: { createdAt: "desc" },
+    take: 1,
+  });
 
-    const lastRow = rows[0] as { content?: unknown } | undefined;
-    const content = lastRow?.content;
-    if (!Array.isArray(content)) return messages;
+  const lastRow = rows[0] as { content?: unknown } | undefined;
+  const content = lastRow?.content;
+  if (!Array.isArray(content)) return messages;
 
-    const slugByDocumentId = new Map<string, string>();
-    for (const [slug, info] of Object.entries(docIndex)) {
-        if (info.document_id) slugByDocumentId.set(info.document_id, slug);
+  const slugByDocumentId = new Map<string, string>();
+  for (const [slug, info] of Object.entries(docIndex)) {
+    if (info.document_id) slugByDocumentId.set(info.document_id, slug);
+  }
+  const refFor = (documentId: unknown, filename: unknown) => {
+    const slug = typeof documentId === "string" ? slugByDocumentId.get(documentId) : undefined;
+    return slug ? `${slug} ("${filename}")` : `"${filename}"`;
+  };
+
+  const lines: string[] = [];
+  for (const ev of content as Record<string, unknown>[]) {
+    if (ev?.type === "doc_created") {
+      lines.push(`- generate_docx → ${refFor(ev.document_id, ev.filename)}`);
+    } else if (ev?.type === "doc_edited") {
+      lines.push(`- edit_document → ${refFor(ev.document_id, ev.filename)}`);
+    } else if (ev?.type === "doc_read") {
+      lines.push(`- read_document → ${refFor(ev.document_id, ev.filename)}`);
+    } else if (ev?.type === "doc_replicated") {
+      // The model needs to know what each copy resolved to so it
+      // can call edit_document / read_document on them. Emit one
+      // line per copy, all attributed back to the same source.
+      const srcLabel = typeof ev.filename === "string" ? `"${ev.filename}"` : "";
+      const copies = Array.isArray(ev.copies)
+        ? (ev.copies as {
+            new_filename?: unknown;
+            document_id?: unknown;
+          }[])
+        : [];
+      for (const c of copies) {
+        const ref = refFor(c.document_id, c.new_filename);
+        lines.push(
+          srcLabel
+            ? `- replicate_document → ${ref} (copy of ${srcLabel})`
+            : `- replicate_document → ${ref}`,
+        );
+      }
+    } else if (ev?.type === "workflow_applied") {
+      lines.push(`- applied workflow: "${ev.title}"`);
     }
-    const refFor = (documentId: unknown, filename: unknown) => {
-        const slug =
-            typeof documentId === "string"
-                ? slugByDocumentId.get(documentId)
-                : undefined;
-        return slug ? `${slug} ("${filename}")` : `"${filename}"`;
-    };
+  }
+  if (lines.length === 0) return messages;
+  const summary = `\n\n[Tool activity in your previous turn]\n${lines.join("\n")}`;
 
-    const lines: string[] = [];
-    for (const ev of content as Record<string, unknown>[]) {
-        if (ev?.type === "doc_created") {
-            lines.push(
-                `- generate_docx → ${refFor(ev.document_id, ev.filename)}`,
-            );
-        } else if (ev?.type === "doc_edited") {
-            lines.push(
-                `- edit_document → ${refFor(ev.document_id, ev.filename)}`,
-            );
-        } else if (ev?.type === "doc_read") {
-            lines.push(
-                `- read_document → ${refFor(ev.document_id, ev.filename)}`,
-            );
-        } else if (ev?.type === "doc_replicated") {
-            // The model needs to know what each copy resolved to so it
-            // can call edit_document / read_document on them. Emit one
-            // line per copy, all attributed back to the same source.
-            const srcLabel =
-                typeof ev.filename === "string" ? `"${ev.filename}"` : "";
-            const copies = Array.isArray(ev.copies)
-                ? (ev.copies as {
-                      new_filename?: unknown;
-                      document_id?: unknown;
-                  }[])
-                : [];
-            for (const c of copies) {
-                const ref = refFor(c.document_id, c.new_filename);
-                lines.push(
-                    srcLabel
-                        ? `- replicate_document → ${ref} (copy of ${srcLabel})`
-                        : `- replicate_document → ${ref}`,
-                );
-            }
-        } else if (ev?.type === "workflow_applied") {
-            lines.push(`- applied workflow: "${ev.title}"`);
-        }
+  // Find the index of the last assistant message and attach the
+  // summary there only.
+  let lastAssistantIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "assistant") {
+      lastAssistantIdx = i;
+      break;
     }
-    if (lines.length === 0) return messages;
-    const summary = `\n\n[Tool activity in your previous turn]\n${lines.join("\n")}`;
-
-    // Find the index of the last assistant message and attach the
-    // summary there only.
-    let lastAssistantIdx = -1;
-    for (let i = messages.length - 1; i >= 0; i--) {
-        if (messages[i].role === "assistant") {
-            lastAssistantIdx = i;
-            break;
-        }
-    }
-    if (lastAssistantIdx < 0) return messages;
-    const enriched = messages.slice();
-    const target = enriched[lastAssistantIdx];
-    enriched[lastAssistantIdx] = {
-        ...target,
-        content: (target.content ?? "") + summary,
-    };
-    return enriched;
+  }
+  if (lastAssistantIdx < 0) return messages;
+  const enriched = messages.slice();
+  const target = enriched[lastAssistantIdx];
+  enriched[lastAssistantIdx] = {
+    ...target,
+    content: (target.content ?? "") + summary,
+  };
+  return enriched;
 }
 
 export function buildMessages(
-    messages: ChatMessage[],
-    docAvailability: {
-        doc_id: string;
-        filename: string;
-        folder_path?: string;
-    }[],
-    systemPromptExtra?: string,
-    docIndex?: DocIndex,
+  messages: ChatMessage[],
+  docAvailability: {
+    doc_id: string;
+    filename: string;
+    folder_path?: string;
+  }[],
+  systemPromptExtra?: string,
+  docIndex?: DocIndex,
 ) {
-    const formatted: unknown[] = [];
-    let systemContent = SYSTEM_PROMPT;
+  const formatted: unknown[] = [];
+  let systemContent = SYSTEM_PROMPT;
 
-    if (systemPromptExtra) {
-        systemContent += `\n\n${systemPromptExtra.trim()}`;
-    }
+  if (systemPromptExtra) {
+    systemContent += `\n\n${systemPromptExtra.trim()}`;
+  }
 
-    if (docAvailability.length) {
-        systemContent += "\n\n---\nAVAILABLE DOCUMENTS:\n";
-        for (const doc of docAvailability) {
-            const label = doc.folder_path
-                ? `${doc.folder_path} / ${doc.filename}`
-                : doc.filename;
-            systemContent += `- ${doc.doc_id}: ${label}\n`;
-        }
-        systemContent +=
-            "\nYou do NOT retain document content between conversation turns. You MUST call read_document (or fetch_documents) at the start of every response that involves a document's content, even if you have read it in a previous turn. Failure to do so will result in hallucinated or stale content.\n---\n";
+  if (docAvailability.length) {
+    systemContent += "\n\n---\nAVAILABLE DOCUMENTS:\n";
+    for (const doc of docAvailability) {
+      const label = doc.folder_path
+        ? `${sanitizeLlmInput(doc.folder_path)} / ${sanitizeLlmInput(doc.filename)}`
+        : sanitizeLlmInput(doc.filename);
+      systemContent += `- ${doc.doc_id}: ${label}\n`;
     }
-    formatted.push({ role: "system", content: systemContent });
+    systemContent +=
+      "\nYou do NOT retain document content between conversation turns. You MUST call read_document (or fetch_documents) at the start of every response that involves a document's content, even if you have read it in a previous turn. Failure to do so will result in hallucinated or stale content.\n---\n";
+  }
+  formatted.push({ role: "system", content: systemContent });
 
-    // Map document_id (UUID) → current-turn doc_id slug, so when we
-    // inline a user attachment we hand the model the same handle it
-    // would use to call read_document / fetch_documents.
-    const slugByDocumentId = new Map<string, string>();
-    if (docIndex) {
-        for (const [slug, info] of Object.entries(docIndex)) {
-            if (info.document_id) slugByDocumentId.set(info.document_id, slug);
-        }
+  // Map document_id (UUID) → current-turn doc_id slug, so when we
+  // inline a user attachment we hand the model the same handle it
+  // would use to call read_document / fetch_documents.
+  const slugByDocumentId = new Map<string, string>();
+  if (docIndex) {
+    for (const [slug, info] of Object.entries(docIndex)) {
+      if (info.document_id) slugByDocumentId.set(info.document_id, slug);
     }
+  }
 
-    for (const msg of messages) {
-        let content = msg.content ?? "";
-        if (msg.role === "user" && msg.workflow) {
-            content = `[Workflow: ${msg.workflow.title} (id: ${msg.workflow.id})]\n\n${content}`;
-        }
-        if (msg.role === "user" && msg.files?.length) {
-            const lines = msg.files.map((f) => {
-                const slug = f.document_id
-                    ? slugByDocumentId.get(f.document_id)
-                    : undefined;
-                return slug ? `- ${slug}: ${f.filename}` : `- ${f.filename}`;
-            });
-            content = `[The user attached the following document(s) to this message:\n${lines.join("\n")}]\n\n${content}`;
-        }
-        formatted.push({ role: msg.role, content });
+  for (const msg of messages) {
+    let content = msg.content ?? "";
+    if (msg.role === "user" && msg.workflow) {
+      content = `[Workflow: ${msg.workflow.title} (id: ${msg.workflow.id})]\n\n${content}`;
     }
-    return formatted;
+    if (msg.role === "user" && msg.files?.length) {
+      const lines = msg.files.map((f) => {
+        const slug = f.document_id ? slugByDocumentId.get(f.document_id) : undefined;
+        return slug ? `- ${slug}: ${f.filename}` : `- ${f.filename}`;
+      });
+      content = `[The user attached the following document(s) to this message:\n${lines.join("\n")}]\n\n${content}`;
+    }
+    formatted.push({ role: msg.role, content });
+  }
+  return formatted;
 }
 
 export async function extractPdfText(buf: ArrayBuffer): Promise<string> {
-    try {
-        const pdfjsLib = await import(
-            "pdfjs-dist/legacy/build/pdf.mjs" as string
-        );
-        const pdf = await (
-            pdfjsLib as unknown as {
-                getDocument: (opts: unknown) => {
-                    promise: Promise<{
-                        numPages: number;
-                        getPage: (n: number) => Promise<{
-                            getTextContent: () => Promise<{
-                                items: { str?: string }[];
-                            }>;
-                        }>;
-                    }>;
-                };
-            }
-        ).getDocument({
-            data: new Uint8Array(buf),
-            standardFontDataUrl: STANDARD_FONT_DATA_URL,
-        }).promise;
-        const parts: string[] = [];
-        for (let i = 1; i <= pdf.numPages; i++) {
-            const page = await pdf.getPage(i);
-            const textContent = await page.getTextContent();
-            parts.push(
-                `[Page ${i}]\n${textContent.items.map((it) => it.str ?? "").join(" ")}`,
-            );
-        }
-        return parts.join("\n\n");
-    } catch {
-        return "";
+  try {
+    const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs" as string);
+    const pdf = await (
+      pdfjsLib as unknown as {
+        getDocument: (opts: unknown) => {
+          promise: Promise<{
+            numPages: number;
+            getPage: (n: number) => Promise<{
+              getTextContent: () => Promise<{
+                items: { str?: string }[];
+              }>;
+            }>;
+          }>;
+        };
+      }
+    ).getDocument({
+      data: new Uint8Array(buf),
+      standardFontDataUrl: STANDARD_FONT_DATA_URL,
+    }).promise;
+    const parts: string[] = [];
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const textContent = await page.getTextContent();
+      parts.push(`[Page ${i}]\n${textContent.items.map((it) => it.str ?? "").join(" ")}`);
     }
+    return parts.join("\n\n");
+  } catch {
+    return "";
+  }
 }
 
 export async function generateDocx(
-    title: string,
-    sections: unknown[],
-    userId: string,
-    options?: { landscape?: boolean; projectId?: string | null },
+  title: string,
+  sections: unknown[],
+  userId: string,
+  options?: { landscape?: boolean; projectId?: string | null },
 ) {
-    try {
-        const {
-            Document,
-            Paragraph,
-            HeadingLevel,
-            Packer,
-            Table,
-            TableRow,
-            TableCell,
-            WidthType,
-            BorderStyle,
-            TextRun,
-            AlignmentType,
-            LevelFormat,
-            LevelSuffix,
-            PageOrientation,
-            PageBreak,
-        } = await import("docx");
+  try {
+    const {
+      Document,
+      Paragraph,
+      HeadingLevel,
+      Packer,
+      Table,
+      TableRow,
+      TableCell,
+      WidthType,
+      BorderStyle,
+      TextRun,
+      AlignmentType,
+      LevelFormat,
+      LevelSuffix,
+      PageOrientation,
+      PageBreak,
+    } = await import("docx");
 
-        const FONT = "Times New Roman";
-        const SIZE = 22; // 11pt in half-points
+    const FONT = "Times New Roman";
+    const SIZE = 22; // 11pt in half-points
 
-        type DocChild =
-            | InstanceType<typeof Paragraph>
-            | InstanceType<typeof Table>;
-        const children: DocChild[] = [];
-        children.push(
+    type DocChild = InstanceType<typeof Paragraph> | InstanceType<typeof Table>;
+    const children: DocChild[] = [];
+    children.push(
+      new Paragraph({
+        heading: HeadingLevel.TITLE,
+        spacing: { after: 200 },
+        alignment: AlignmentType.CENTER,
+        children: [
+          new TextRun({
+            text: title.toUpperCase(),
+            color: "000000",
+            font: FONT,
+            size: SIZE,
+            bold: true,
+          }),
+        ],
+      }),
+    );
+
+    const cellBorder = {
+      top: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
+      bottom: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
+      left: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
+      right: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
+    };
+
+    const headingLevels = [
+      HeadingLevel.HEADING_1,
+      HeadingLevel.HEADING_2,
+      HeadingLevel.HEADING_3,
+      HeadingLevel.HEADING_4,
+    ];
+    const LEGAL_NUMBERING_REF = "legal-clause-numbering";
+    const legalNumbering = (level: number) => ({
+      reference: LEGAL_NUMBERING_REF,
+      level: Math.max(0, Math.min(level, 4)),
+    });
+    const legalNumberingLevels = [
+      {
+        level: 0,
+        format: LevelFormat.DECIMAL,
+        text: "%1.",
+        alignment: AlignmentType.START,
+        suffix: LevelSuffix.TAB,
+        isLegalNumberingStyle: true,
+        style: {
+          paragraph: { indent: { left: 720, hanging: 720 } },
+          run: {
+            bold: true,
+            color: "000000",
+            font: FONT,
+            size: SIZE,
+          },
+        },
+      },
+      {
+        level: 1,
+        format: LevelFormat.DECIMAL,
+        text: "%1.%2",
+        alignment: AlignmentType.START,
+        suffix: LevelSuffix.TAB,
+        isLegalNumberingStyle: true,
+        style: {
+          paragraph: { indent: { left: 720, hanging: 720 } },
+          run: { color: "000000", font: FONT, size: SIZE },
+        },
+      },
+      {
+        level: 2,
+        format: LevelFormat.LOWER_LETTER,
+        text: "(%3)",
+        alignment: AlignmentType.START,
+        suffix: LevelSuffix.TAB,
+        style: {
+          paragraph: { indent: { left: 1440, hanging: 720 } },
+          run: { color: "000000", font: FONT, size: SIZE },
+        },
+      },
+      {
+        level: 3,
+        format: LevelFormat.LOWER_ROMAN,
+        text: "(%4)",
+        alignment: AlignmentType.START,
+        suffix: LevelSuffix.TAB,
+        style: {
+          paragraph: { indent: { left: 1440, hanging: 720 } },
+          run: { color: "000000", font: FONT, size: SIZE },
+        },
+      },
+      {
+        level: 4,
+        format: LevelFormat.UPPER_LETTER,
+        text: "(%5)",
+        alignment: AlignmentType.START,
+        suffix: LevelSuffix.TAB,
+        style: {
+          paragraph: { indent: { left: 2520, hanging: 720 } },
+          run: { color: "000000", font: FONT, size: SIZE },
+        },
+      },
+    ];
+    const normalizeTable = (table: unknown): { headers: string[]; rows: string[][] } | null => {
+      if (!table || typeof table !== "object") return null;
+      const raw = table as { headers?: unknown; rows?: unknown };
+      const headers = Array.isArray(raw.headers)
+        ? raw.headers
+            .map((header) => (typeof header === "string" ? header.trim() : ""))
+            .filter(Boolean)
+        : [];
+      if (headers.length === 0) return null;
+
+      const rawRows = Array.isArray(raw.rows) ? raw.rows : [];
+      const rows = rawRows
+        .filter((row): row is unknown[] => Array.isArray(row))
+        .map((row) => headers.map((_, i) => (typeof row[i] === "string" ? row[i] : "")));
+
+      return { headers, rows };
+    };
+    const stripManualNumbering = (
+      value: string,
+    ): { text: string; levelFromPrefix: number | null } => {
+      const match = value.trim().match(/^(\d+(?:\.\d+)*)(?:[.)])?\s+(.+)$/);
+      if (!match) return { text: value.trim(), levelFromPrefix: null };
+      return {
+        text: match[2].trim(),
+        levelFromPrefix: match[1].split(".").length - 1,
+      };
+    };
+    const parseManualListMarker = (value: string): { text: string; levelOffset: number | null } => {
+      const trimmed = value.trim();
+      const match = trimmed.match(/^(\(([a-z]+)\)|([a-z]+)[.)])\s+(.+)$/i);
+      if (!match) return { text: trimmed, levelOffset: null };
+      const marker = (match[2] ?? match[3] ?? "").toLowerCase();
+      const isRoman =
+        marker === "i" ||
+        (marker.length > 1 &&
+          /^(?:m{0,4}(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3}))$/i.test(marker));
+      return { text: match[4].trim(), levelOffset: isRoman ? 3 : 2 };
+    };
+    const normalizeHeadingText = (value: string) =>
+      value
+        .trim()
+        .replace(/[^a-zA-Z0-9]+/g, " ")
+        .trim()
+        .toLowerCase();
+
+    const isTitleLikeFirstHeading = (heading: string, sectionIndex: number) => {
+      if (sectionIndex !== 0) return false;
+      const normalized = normalizeHeadingText(heading);
+      const titleNormalized = normalizeHeadingText(title);
+      if (!normalized || !titleNormalized) return false;
+      if (normalized === titleNormalized) return true;
+      return (
+        titleNormalized.includes(normalized) &&
+        /\b(agreement|contract|deed|terms|policy|notice|nda|disclosure)\b/.test(normalized)
+      );
+    };
+
+    const isUnnumberedHeading = (heading: string, sectionIndex: number) => {
+      const normalized = normalizeHeadingText(heading);
+      if (!normalized) return true;
+      if (normalized === "signatures" || normalized === "signature") {
+        return true;
+      }
+      if (isTitleLikeFirstHeading(heading, sectionIndex)) {
+        return true;
+      }
+      if (
+        sectionIndex === 0 &&
+        /^(agreement|contract|mutual non disclosure agreement|non disclosure agreement|employment agreement|service level agreement)$/.test(
+          normalized,
+        )
+      ) {
+        return true;
+      }
+      return false;
+    };
+    const isSignatureLine = (value: string) => /^(?:by|name|title|date):\s*/i.test(value.trim());
+    const looksLikeSignatureBlock = (value: string) => {
+      const lines = value
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+      if (lines.length === 0) return false;
+      const signatureLineCount = lines.filter(isSignatureLine).length;
+      return signatureLineCount >= 2;
+    };
+    let currentClauseLevel: number | null = null;
+
+    for (const [sectionIndex, section] of (
+      sections as {
+        heading?: string;
+        content?: string;
+        level?: number;
+        pageBreak?: boolean;
+        table?: { headers: string[]; rows: string[][] };
+      }[]
+    ).entries()) {
+      if (section.pageBreak) {
+        children.push(new Paragraph({ children: [new PageBreak()] }));
+      }
+      if (section.heading) {
+        const stripped = stripManualNumbering(section.heading);
+        const isUnnumbered = isUnnumberedHeading(stripped.text, sectionIndex);
+        const skipHeading = isTitleLikeFirstHeading(stripped.text, sectionIndex);
+        const idx = Math.min(stripped.levelFromPrefix ?? (section.level ?? 1) - 1, 3);
+        currentClauseLevel = isUnnumbered || skipHeading ? null : idx;
+        const headingText =
+          idx === 0 && !isUnnumbered ? stripped.text.toUpperCase() : stripped.text;
+        if (!skipHeading) {
+          children.push(
             new Paragraph({
-                heading: HeadingLevel.TITLE,
-                spacing: { after: 200 },
-                alignment: AlignmentType.CENTER,
-                children: [
-                    new TextRun({
-                        text: title.toUpperCase(),
-                        color: "000000",
-                        font: FONT,
-                        size: SIZE,
-                        bold: true,
-                    }),
-                ],
+              heading: headingLevels[idx],
+              numbering: isUnnumbered ? undefined : legalNumbering(idx),
+              spacing: { after: 160 },
+              children: [
+                new TextRun({
+                  text: headingText,
+                  color: "000000",
+                  font: FONT,
+                  size: SIZE,
+                  bold: true,
+                }),
+              ],
             }),
-        );
-
-        const cellBorder = {
-            top: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
-            bottom: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
-            left: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
-            right: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
-        };
-
-        const headingLevels = [
-            HeadingLevel.HEADING_1,
-            HeadingLevel.HEADING_2,
-            HeadingLevel.HEADING_3,
-            HeadingLevel.HEADING_4,
-        ];
-        const LEGAL_NUMBERING_REF = "legal-clause-numbering";
-        const legalNumbering = (level: number) => ({
-            reference: LEGAL_NUMBERING_REF,
-            level: Math.max(0, Math.min(level, 4)),
-        });
-        const legalNumberingLevels = [
-            {
-                level: 0,
-                format: LevelFormat.DECIMAL,
-                text: "%1.",
-                alignment: AlignmentType.START,
-                suffix: LevelSuffix.TAB,
-                isLegalNumberingStyle: true,
-                style: {
-                    paragraph: { indent: { left: 720, hanging: 720 } },
-                    run: {
-                        bold: true,
-                        color: "000000",
-                        font: FONT,
-                        size: SIZE,
-                    },
-                },
-            },
-            {
-                level: 1,
-                format: LevelFormat.DECIMAL,
-                text: "%1.%2",
-                alignment: AlignmentType.START,
-                suffix: LevelSuffix.TAB,
-                isLegalNumberingStyle: true,
-                style: {
-                    paragraph: { indent: { left: 720, hanging: 720 } },
-                    run: { color: "000000", font: FONT, size: SIZE },
-                },
-            },
-            {
-                level: 2,
-                format: LevelFormat.LOWER_LETTER,
-                text: "(%3)",
-                alignment: AlignmentType.START,
-                suffix: LevelSuffix.TAB,
-                style: {
-                    paragraph: { indent: { left: 1440, hanging: 720 } },
-                    run: { color: "000000", font: FONT, size: SIZE },
-                },
-            },
-            {
-                level: 3,
-                format: LevelFormat.LOWER_ROMAN,
-                text: "(%4)",
-                alignment: AlignmentType.START,
-                suffix: LevelSuffix.TAB,
-                style: {
-                    paragraph: { indent: { left: 1440, hanging: 720 } },
-                    run: { color: "000000", font: FONT, size: SIZE },
-                },
-            },
-            {
-                level: 4,
-                format: LevelFormat.UPPER_LETTER,
-                text: "(%5)",
-                alignment: AlignmentType.START,
-                suffix: LevelSuffix.TAB,
-                style: {
-                    paragraph: { indent: { left: 2520, hanging: 720 } },
-                    run: { color: "000000", font: FONT, size: SIZE },
-                },
-            },
-        ];
-        const normalizeTable = (
-            table: unknown,
-        ): { headers: string[]; rows: string[][] } | null => {
-            if (!table || typeof table !== "object") return null;
-            const raw = table as { headers?: unknown; rows?: unknown };
-            const headers = Array.isArray(raw.headers)
-                ? raw.headers
-                      .map((header) =>
-                          typeof header === "string" ? header.trim() : "",
-                      )
-                      .filter(Boolean)
-                : [];
-            if (headers.length === 0) return null;
-
-            const rawRows = Array.isArray(raw.rows) ? raw.rows : [];
-            const rows = rawRows
-                .filter((row): row is unknown[] => Array.isArray(row))
-                .map((row) =>
-                    headers.map((_, i) =>
-                        typeof row[i] === "string" ? row[i] : "",
-                    ),
-                );
-
-            return { headers, rows };
-        };
-        const stripManualNumbering = (
-            value: string,
-        ): { text: string; levelFromPrefix: number | null } => {
-            const match = value
-                .trim()
-                .match(/^(\d+(?:\.\d+)*)(?:[.)])?\s+(.+)$/);
-            if (!match) return { text: value.trim(), levelFromPrefix: null };
-            return {
-                text: match[2].trim(),
-                levelFromPrefix: match[1].split(".").length - 1,
-            };
-        };
-        const parseManualListMarker = (
-            value: string,
-        ): { text: string; levelOffset: number | null } => {
-            const trimmed = value.trim();
-            const match = trimmed.match(/^(\(([a-z]+)\)|([a-z]+)[.)])\s+(.+)$/i);
-            if (!match) return { text: trimmed, levelOffset: null };
-            const marker = (match[2] ?? match[3] ?? "").toLowerCase();
-            const isRoman =
-                marker === "i" ||
-                (marker.length > 1 &&
-                    /^(?:m{0,4}(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3}))$/i.test(
-                        marker,
-                    ));
-            return { text: match[4].trim(), levelOffset: isRoman ? 3 : 2 };
-        };
-        const normalizeHeadingText = (value: string) =>
-            value
-                .trim()
-                .replace(/[^a-zA-Z0-9]+/g, " ")
-                .trim()
-                .toLowerCase();
-
-        const isTitleLikeFirstHeading = (
-            heading: string,
-            sectionIndex: number,
-        ) => {
-            if (sectionIndex !== 0) return false;
-            const normalized = normalizeHeadingText(heading);
-            const titleNormalized = normalizeHeadingText(title);
-            if (!normalized || !titleNormalized) return false;
-            if (normalized === titleNormalized) return true;
-            return (
-                titleNormalized.includes(normalized) &&
-                /\b(agreement|contract|deed|terms|policy|notice|nda|disclosure)\b/.test(
-                    normalized,
-                )
-            );
-        };
-
-        const isUnnumberedHeading = (heading: string, sectionIndex: number) => {
-            const normalized = normalizeHeadingText(heading);
-            if (!normalized) return true;
-            if (normalized === "signatures" || normalized === "signature") {
-                return true;
-            }
-            if (isTitleLikeFirstHeading(heading, sectionIndex)) {
-                return true;
-            }
-            if (
-                sectionIndex === 0 &&
-                /^(agreement|contract|mutual non disclosure agreement|non disclosure agreement|employment agreement|service level agreement)$/.test(
-                    normalized,
-                )
-            ) {
-                return true;
-            }
-            return false;
-        };
-        const isSignatureLine = (value: string) =>
-            /^(?:by|name|title|date):\s*/i.test(value.trim());
-        const looksLikeSignatureBlock = (value: string) => {
-            const lines = value
-                .split("\n")
-                .map((line) => line.trim())
-                .filter(Boolean);
-            if (lines.length === 0) return false;
-            const signatureLineCount = lines.filter(isSignatureLine).length;
-            return signatureLineCount >= 2;
-        };
-        let currentClauseLevel: number | null = null;
-
-        for (const [sectionIndex, section] of (sections as {
-            heading?: string;
-            content?: string;
-            level?: number;
-            pageBreak?: boolean;
-            table?: { headers: string[]; rows: string[][] };
-        }[]).entries()) {
-            if (section.pageBreak) {
-                children.push(new Paragraph({ children: [new PageBreak()] }));
-            }
-            if (section.heading) {
-                const stripped = stripManualNumbering(section.heading);
-                const isUnnumbered = isUnnumberedHeading(
-                    stripped.text,
-                    sectionIndex,
-                );
-                const skipHeading = isTitleLikeFirstHeading(
-                    stripped.text,
-                    sectionIndex,
-                );
-                const idx = Math.min(
-                    stripped.levelFromPrefix ?? (section.level ?? 1) - 1,
-                    3,
-                );
-                currentClauseLevel = isUnnumbered || skipHeading ? null : idx;
-                const headingText =
-                    idx === 0 && !isUnnumbered
-                        ? stripped.text.toUpperCase()
-                        : stripped.text;
-                if (!skipHeading) {
-                    children.push(
-                        new Paragraph({
-                            heading: headingLevels[idx],
-                            numbering: isUnnumbered
-                                ? undefined
-                                : legalNumbering(idx),
-                            spacing: { after: 160 },
-                            children: [
-                                new TextRun({
-                                    text: headingText,
-                                    color: "000000",
-                                    font: FONT,
-                                    size: SIZE,
-                                    bold: true,
-                                }),
-                            ],
-                        }),
-                    );
-                }
-            }
-            const normalizedTable = normalizeTable(section.table);
-            if (normalizedTable) {
-                const { headers, rows } = normalizedTable;
-                const colCount = headers.length;
-                const tableRows: InstanceType<typeof TableRow>[] = [];
-                // Header row
-                tableRows.push(
-                    new TableRow({
-                        tableHeader: true,
-                        children: headers.map(
-                            (h) =>
-                                new TableCell({
-                                    borders: cellBorder,
-                                    shading: { fill: "F2F2F2" },
-                                    children: [
-                                        new Paragraph({
-                                            children: [
-                                                new TextRun({
-                                                    text: h,
-                                                    bold: true,
-                                                    font: FONT,
-                                                    size: SIZE,
-                                                }),
-                                            ],
-                                            alignment: AlignmentType.LEFT,
-                                        }),
-                                    ],
-                                }),
-                        ),
-                    }),
-                );
-                // Data rows — normalize each row to exactly colCount cells.
-                // LLMs occasionally emit malformed rows (extra fragments from
-                // stray delimiters, or short rows); padding/truncating here
-                // keeps the rendered table aligned to the headers.
-                for (const normalized of rows) {
-                    tableRows.push(
-                        new TableRow({
-                            children: normalized.map(
-                                (cell) =>
-                                    new TableCell({
-                                        borders: cellBorder,
-                                        children: [
-                                            new Paragraph({
-                                                children: [
-                                                    new TextRun({
-                                                        text: cell,
-                                                        font: FONT,
-                                                        size: SIZE,
-                                                    }),
-                                                ],
-                                            }),
-                                        ],
-                                    }),
-                            ),
-                        }),
-                    );
-                }
-                children.push(
-                    new Table({
-                        width: { size: 100, type: WidthType.PERCENTAGE },
-                        rows: tableRows,
-                    }),
-                );
-                children.push(new Paragraph({ text: "" }));
-            }
-            if (section.content) {
-                let numberedBodyParagraphs = 0;
-                const contentIsSignatureBlock =
-                    section.heading &&
-                    normalizeHeadingText(section.heading).includes("signature")
-                        ? true
-                        : looksLikeSignatureBlock(section.content);
-                for (const line of section.content.split("\n")) {
-                    const trimmed = line.trim();
-                    if (!trimmed) continue;
-                    const bulletMatch = trimmed.match(/^[-•*]\s+(.+)/);
-                    const rawText = bulletMatch
-                        ? bulletMatch[1].trim()
-                        : trimmed;
-                    const manualList = parseManualListMarker(rawText);
-                    const numeric = stripManualNumbering(rawText);
-                    const text = bulletMatch
-                        ? rawText
-                        : manualList.levelOffset !== null
-                          ? manualList.text
-                          : numeric.text;
-                    const inferredLevel =
-                        currentClauseLevel === null || contentIsSignatureBlock
-                            ? undefined
-                            : bulletMatch
-                              ? currentClauseLevel + 2
-                              : manualList.levelOffset !== null
-                                ? currentClauseLevel + manualList.levelOffset
-                              : numeric.levelFromPrefix !== null
-                                ? numeric.levelFromPrefix
-                                : numberedBodyParagraphs === 0
-                                  ? currentClauseLevel + 1
-                                  : currentClauseLevel + 2;
-                    if (currentClauseLevel !== null) numberedBodyParagraphs++;
-                    children.push(
-                        new Paragraph({
-                            numbering:
-                                inferredLevel === undefined
-                                    ? undefined
-                                    : legalNumbering(inferredLevel),
-                            spacing: { after: 120 },
-                            children: [
-                                new TextRun({
-                                    text,
-                                    font: FONT,
-                                    size: SIZE,
-                                }),
-                            ],
-                        }),
-                    );
-                }
-            }
+          );
         }
-
-        const pageSetup = options?.landscape
-            ? { page: { size: { orientation: PageOrientation.LANDSCAPE } } }
-            : {};
-
-        const doc = new Document({
-            numbering: {
-                config: [
-                    {
-                        reference: LEGAL_NUMBERING_REF,
-                        levels: legalNumberingLevels,
-                    },
-                ],
-            },
-            sections: [{ properties: pageSetup, children }],
-        });
-        const buf = await Packer.toBuffer(doc);
-        const zip = await import("jszip");
-        const packageZip = await zip.default.loadAsync(buf);
-        for (const requiredPath of [
-            "[Content_Types].xml",
-            "word/document.xml",
-            "word/_rels/document.xml.rels",
-        ]) {
-            if (!packageZip.file(requiredPath)) {
-                return {
-                    error: `Generated DOCX is missing required package part: ${requiredPath}`,
-                };
-            }
-        }
-        const docId = crypto.randomUUID().replace(/-/g, "");
-        const safeTitle =
-            title
-                .replace(/[^a-zA-Z0-9 -]/g, "")
-                .trim()
-                .slice(0, 64) || "document";
-        const filename = `${safeTitle}.docx`;
-        const key = generatedDocKey(userId, docId, filename);
-
-        await uploadFile(
-            key,
-            buf.buffer as ArrayBuffer,
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      }
+      const normalizedTable = normalizeTable(section.table);
+      if (normalizedTable) {
+        const { headers, rows } = normalizedTable;
+        const colCount = headers.length;
+        const tableRows: InstanceType<typeof TableRow>[] = [];
+        // Header row
+        tableRows.push(
+          new TableRow({
+            tableHeader: true,
+            children: headers.map(
+              (h) =>
+                new TableCell({
+                  borders: cellBorder,
+                  shading: { fill: "F2F2F2" },
+                  children: [
+                    new Paragraph({
+                      children: [
+                        new TextRun({
+                          text: h,
+                          bold: true,
+                          font: FONT,
+                          size: SIZE,
+                        }),
+                      ],
+                      alignment: AlignmentType.LEFT,
+                    }),
+                  ],
+                }),
+            ),
+          }),
         );
-        const downloadUrl = buildDownloadUrl(key, filename);
-
-        // Persist to DB so generated docs are first-class documents:
-        // openable in the DocPanel and editable via edit_document. In
-        // project chats we attach to the project so it appears in the
-        // sidebar; in the general chat we leave project_id null and it
-        // stays a standalone document.
-        const docRow = await prisma.document.create({
-            data: {
-                projectId: options?.projectId ?? null,
-                userId,
-                filename,
-                fileType: "docx",
-                sizeBytes: buf.byteLength,
-                status: "ready",
-            },
-            select: { id: true },
-        });
-        const documentId = docRow.id;
-
-        const versionRow = await prisma.documentVersion.create({
-            data: {
-                documentId,
-                storagePath: key,
-                source: "generated",
-                versionNumber: 1,
-                displayName: filename,
-            },
-            select: { id: true },
-        });
-        const versionId = versionRow.id;
-
-        await prisma.document.update({
-            where: { id: documentId },
-            data: { currentVersionId: versionId },
-        });
-
-        return {
-            filename,
-            download_url: downloadUrl,
-            document_id: documentId,
-            version_id: versionId,
-            version_number: 1,
-            storage_path: key,
-            message: `Document '${filename}' has been generated successfully.`,
-        };
-    } catch (e) {
-        return { error: String(e) };
+        // Data rows — normalize each row to exactly colCount cells.
+        // LLMs occasionally emit malformed rows (extra fragments from
+        // stray delimiters, or short rows); padding/truncating here
+        // keeps the rendered table aligned to the headers.
+        for (const normalized of rows) {
+          tableRows.push(
+            new TableRow({
+              children: normalized.map(
+                (cell) =>
+                  new TableCell({
+                    borders: cellBorder,
+                    children: [
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: cell,
+                            font: FONT,
+                            size: SIZE,
+                          }),
+                        ],
+                      }),
+                    ],
+                  }),
+              ),
+            }),
+          );
+        }
+        children.push(
+          new Table({
+            width: { size: 100, type: WidthType.PERCENTAGE },
+            rows: tableRows,
+          }),
+        );
+        children.push(new Paragraph({ text: "" }));
+      }
+      if (section.content) {
+        let numberedBodyParagraphs = 0;
+        const contentIsSignatureBlock =
+          section.heading && normalizeHeadingText(section.heading).includes("signature")
+            ? true
+            : looksLikeSignatureBlock(section.content);
+        for (const line of section.content.split("\n")) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          const bulletMatch = trimmed.match(/^[-•*]\s+(.+)/);
+          const rawText = bulletMatch ? bulletMatch[1].trim() : trimmed;
+          const manualList = parseManualListMarker(rawText);
+          const numeric = stripManualNumbering(rawText);
+          const text = bulletMatch
+            ? rawText
+            : manualList.levelOffset !== null
+              ? manualList.text
+              : numeric.text;
+          const inferredLevel =
+            currentClauseLevel === null || contentIsSignatureBlock
+              ? undefined
+              : bulletMatch
+                ? currentClauseLevel + 2
+                : manualList.levelOffset !== null
+                  ? currentClauseLevel + manualList.levelOffset
+                  : numeric.levelFromPrefix !== null
+                    ? numeric.levelFromPrefix
+                    : numberedBodyParagraphs === 0
+                      ? currentClauseLevel + 1
+                      : currentClauseLevel + 2;
+          if (currentClauseLevel !== null) numberedBodyParagraphs++;
+          children.push(
+            new Paragraph({
+              numbering: inferredLevel === undefined ? undefined : legalNumbering(inferredLevel),
+              spacing: { after: 120 },
+              children: [
+                new TextRun({
+                  text,
+                  font: FONT,
+                  size: SIZE,
+                }),
+              ],
+            }),
+          );
+        }
+      }
     }
+
+    const pageSetup = options?.landscape
+      ? { page: { size: { orientation: PageOrientation.LANDSCAPE } } }
+      : {};
+
+    const doc = new Document({
+      numbering: {
+        config: [
+          {
+            reference: LEGAL_NUMBERING_REF,
+            levels: legalNumberingLevels,
+          },
+        ],
+      },
+      sections: [{ properties: pageSetup, children }],
+    });
+    const buf = await Packer.toBuffer(doc);
+    const zip = await import("jszip");
+    const packageZip = await zip.default.loadAsync(buf);
+    for (const requiredPath of [
+      "[Content_Types].xml",
+      "word/document.xml",
+      "word/_rels/document.xml.rels",
+    ]) {
+      if (!packageZip.file(requiredPath)) {
+        return {
+          error: `Generated DOCX is missing required package part: ${requiredPath}`,
+        };
+      }
+    }
+    const docId = crypto.randomUUID().replace(/-/g, "");
+    const safeTitle =
+      title
+        .replace(/[^a-zA-Z0-9 -]/g, "")
+        .trim()
+        .slice(0, 64) || "document";
+    const filename = `${safeTitle}.docx`;
+    const key = generatedDocKey(userId, docId, filename);
+
+    await uploadFile(
+      key,
+      buf.buffer as ArrayBuffer,
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    );
+    const downloadUrl = buildDownloadUrl(key, filename);
+
+    // Persist to DB so generated docs are first-class documents:
+    // openable in the DocPanel and editable via edit_document. In
+    // project chats we attach to the project so it appears in the
+    // sidebar; in the general chat we leave project_id null and it
+    // stays a standalone document.
+    const docRow = await prisma.document.create({
+      data: {
+        projectId: options?.projectId ?? null,
+        userId,
+        filename,
+        fileType: "docx",
+        sizeBytes: buf.byteLength,
+        status: "ready",
+      },
+      select: { id: true },
+    });
+    const documentId = docRow.id;
+
+    const versionRow = await prisma.documentVersion.create({
+      data: {
+        documentId,
+        storagePath: key,
+        source: "generated",
+        versionNumber: 1,
+        displayName: filename,
+      },
+      select: { id: true },
+    });
+    const versionId = versionRow.id;
+
+    await prisma.document.update({
+      where: { id: documentId },
+      data: { currentVersionId: versionId },
+    });
+
+    return {
+      filename,
+      download_url: downloadUrl,
+      document_id: documentId,
+      version_id: versionId,
+      version_number: 1,
+      storage_path: key,
+      message: `Document '${filename}' has been generated successfully.`,
+    };
+  } catch (e) {
+    return { error: String(e) };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1238,13 +1139,13 @@ export async function generateDocx(
  * tracked-changes version if one exists, else the original upload.
  */
 export async function loadCurrentVersionBytes(
-    documentId: string,
+  documentId: string,
 ): Promise<{ bytes: Buffer; storage_path: string } | null> {
-    const active = await loadActiveVersion(documentId);
-    if (!active) return null;
-    const raw = await downloadFile(active.storage_path);
-    if (!raw) return null;
-    return { bytes: Buffer.from(raw), storage_path: active.storage_path };
+  const active = await loadActiveVersion(documentId);
+  if (!active) return null;
+  const raw = await downloadFile(active.storage_path);
+  if (!raw) return null;
+  return { bytes: Buffer.from(raw), storage_path: active.storage_path };
 }
 
 /**
@@ -1253,199 +1154,193 @@ export async function loadCurrentVersionBytes(
  * complete. Idempotent.
  */
 export async function runEditDocument(params: {
-    documentId: string;
-    userId: string;
-    edits: EditInput[];
-    /**
-     * If provided, append these edits to the existing turn-scoped version
-     * (overwrites the file at storagePath and reuses the document_versions
-     * row) instead of creating a new version. Used to collapse multiple
-     * edit_document tool calls within a single assistant turn into one
-     * version.
-     */
-    reuseVersion?: {
-        versionId: string;
-        versionNumber: number;
-        storagePath: string;
-    };
+  documentId: string;
+  userId: string;
+  edits: EditInput[];
+  /**
+   * If provided, append these edits to the existing turn-scoped version
+   * (overwrites the file at storagePath and reuses the document_versions
+   * row) instead of creating a new version. Used to collapse multiple
+   * edit_document tool calls within a single assistant turn into one
+   * version.
+   */
+  reuseVersion?: {
+    versionId: string;
+    versionNumber: number;
+    storagePath: string;
+  };
 }): Promise<
-    | {
-          ok: true;
-          version_id: string;
-          version_number: number;
-          storage_path: string;
-          download_url: string;
-          annotations: EditAnnotation[];
-          errors: { index: number; reason: string }[];
-      }
-    | { ok: false; error: string }
+  | {
+      ok: true;
+      version_id: string;
+      version_number: number;
+      storage_path: string;
+      download_url: string;
+      annotations: EditAnnotation[];
+      errors: { index: number; reason: string }[];
+    }
+  | { ok: false; error: string }
 > {
-    const { documentId, userId, edits, reuseVersion } = params;
+  const { documentId, userId, edits, reuseVersion } = params;
 
-    const doc = await prisma.document.findUnique({
-        where: { id: documentId },
-        select: { id: true, filename: true },
-    });
-    if (!doc) return { ok: false, error: "Document not found." };
+  const doc = await prisma.document.findUnique({
+    where: { id: documentId },
+    select: { id: true, filename: true },
+  });
+  if (!doc) return { ok: false, error: "Document not found." };
 
-    const current = await loadCurrentVersionBytes(documentId);
-    if (!current) return { ok: false, error: "Could not load document bytes." };
+  const current = await loadCurrentVersionBytes(documentId);
+  if (!current) return { ok: false, error: "Could not load document bytes." };
 
-    const {
-        bytes: editedBytes,
-        changes,
-        errors,
-    } = await applyTrackedEdits(current.bytes, edits, { author: "Mike" });
+  const {
+    bytes: editedBytes,
+    changes,
+    errors,
+  } = await applyTrackedEdits(current.bytes, edits, { author: "Mike" });
 
-    if (changes.length === 0) {
-        return {
-            ok: false,
-            error:
-                errors[0]?.reason ??
-                "No edits could be applied. Refine context_before/context_after and retry.",
-        };
-    }
+  if (changes.length === 0) {
+    return {
+      ok: false,
+      error:
+        errors[0]?.reason ??
+        "No edits could be applied. Refine context_before/context_after and retry.",
+    };
+  }
 
-    const ab = editedBytes.buffer.slice(
-        editedBytes.byteOffset,
-        editedBytes.byteOffset + editedBytes.byteLength,
-    ) as ArrayBuffer;
+  const ab = editedBytes.buffer.slice(
+    editedBytes.byteOffset,
+    editedBytes.byteOffset + editedBytes.byteLength,
+  ) as ArrayBuffer;
 
-    let versionRowId: string;
-    let newPath: string;
-    let nextVersionNumber: number;
+  let versionRowId: string;
+  let newPath: string;
+  let nextVersionNumber: number;
 
-    if (reuseVersion) {
-        // Overwrite the existing turn version's file in place. The version
-        // row, version_number, and current_version_id all already point here.
-        newPath = reuseVersion.storagePath;
-        versionRowId = reuseVersion.versionId;
-        nextVersionNumber = reuseVersion.versionNumber;
-        await uploadFile(
-            newPath,
-            ab,
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        );
-    } else {
-        const versionId = crypto.randomUUID().replace(/-/g, "");
-        newPath = `documents/${userId}/${documentId}/edits/${versionId}.docx`;
-        await uploadFile(
-            newPath,
-            ab,
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        );
-
-        // Per-document sequential number for the new assistant_edit
-        // version. The counter spans upload + user_upload + assistant_edit
-        // so the original upload is V1 and the first assistant edit is V2.
-        const maxRow = await prisma.documentVersion.findFirst({
-            where: {
-                documentId,
-                source: { in: ["upload", "user_upload", "assistant_edit"] },
-            },
-            orderBy: { versionNumber: "desc" },
-            select: { versionNumber: true },
-        });
-        nextVersionNumber =
-            ((maxRow?.versionNumber as number | null) ?? 1) + 1;
-
-        // Inherit the display name from the most recent prior version so
-        // user-applied renames carry forward through further edits.
-        const prevRow = await prisma.documentVersion.findFirst({
-            where: { documentId },
-            orderBy: { createdAt: "desc" },
-            select: { displayName: true },
-        });
-        const inheritedDisplayName =
-            prevRow?.displayName ??
-            doc.filename ??
-            null;
-
-        const versionRow = await prisma.documentVersion.create({
-            data: {
-                documentId,
-                storagePath: newPath,
-                source: "assistant_edit",
-                versionNumber: nextVersionNumber,
-                displayName: inheritedDisplayName,
-            },
-            select: { id: true },
-        });
-        versionRowId = versionRow.id;
-    }
-
-    // Insert one row per change
-    const editRows = changes.map((c) => ({
-        documentId,
-        versionId: versionRowId,
-        changeId: c.id,
-        delWId: c.delId ?? null,
-        insWId: c.insId ?? null,
-        deletedText: c.deletedText,
-        insertedText: c.insertedText,
-        contextBefore: c.contextBefore ?? "",
-        contextAfter: c.contextAfter ?? "",
-        status: "pending" as const,
-    }));
-    // createMany doesn't return rows, so we insert individually for the IDs
-    const insertedEdits = [];
-    for (const row of editRows) {
-        const inserted = await prisma.documentEdit.create({
-            data: row,
-            select: {
-                id: true,
-                changeId: true,
-                delWId: true,
-                insWId: true,
-                deletedText: true,
-                insertedText: true,
-                contextBefore: true,
-                contextAfter: true,
-            },
-        });
-        insertedEdits.push(inserted);
-    }
-
-    await prisma.document.update({
-        where: { id: documentId },
-        data: { currentVersionId: versionRowId },
-    });
-
-    const annotations: EditAnnotation[] = insertedEdits.map(
-        (r) => {
-            const src = changes.find((c) => c.id === r.changeId);
-            return {
-                kind: "edit",
-                edit_id: r.id,
-                document_id: documentId,
-                version_id: versionRowId,
-                version_number: nextVersionNumber,
-                change_id: r.changeId,
-                del_w_id: src?.delId,
-                ins_w_id: src?.insId,
-                deleted_text: r.deletedText ?? "",
-                inserted_text: r.insertedText ?? "",
-                context_before: r.contextBefore ?? "",
-                context_after: r.contextAfter ?? "",
-                reason: src?.reason,
-                status: "pending",
-            };
-        },
+  if (reuseVersion) {
+    // Overwrite the existing turn version's file in place. The version
+    // row, version_number, and current_version_id all already point here.
+    newPath = reuseVersion.storagePath;
+    versionRowId = reuseVersion.versionId;
+    nextVersionNumber = reuseVersion.versionNumber;
+    await uploadFile(
+      newPath,
+      ab,
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    );
+  } else {
+    const versionId = crypto.randomUUID().replace(/-/g, "");
+    newPath = `documents/${userId}/${documentId}/edits/${versionId}.docx`;
+    await uploadFile(
+      newPath,
+      ab,
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     );
 
-    // Persistent, non-expiring permalink. The backend streams fresh bytes
-    // on each request, so this URL stays valid as long as the file exists.
-    const permalink = buildDownloadUrl(newPath, doc.filename as string);
+    // Per-document sequential number for the new assistant_edit
+    // version. The counter spans upload + user_upload + assistant_edit
+    // so the original upload is V1 and the first assistant edit is V2.
+    const maxRow = await prisma.documentVersion.findFirst({
+      where: {
+        documentId,
+        source: { in: ["upload", "user_upload", "assistant_edit"] },
+      },
+      orderBy: { versionNumber: "desc" },
+      select: { versionNumber: true },
+    });
+    nextVersionNumber = ((maxRow?.versionNumber as number | null) ?? 1) + 1;
 
+    // Inherit the display name from the most recent prior version so
+    // user-applied renames carry forward through further edits.
+    const prevRow = await prisma.documentVersion.findFirst({
+      where: { documentId },
+      orderBy: { createdAt: "desc" },
+      select: { displayName: true },
+    });
+    const inheritedDisplayName = prevRow?.displayName ?? doc.filename ?? null;
+
+    const versionRow = await prisma.documentVersion.create({
+      data: {
+        documentId,
+        storagePath: newPath,
+        source: "assistant_edit",
+        versionNumber: nextVersionNumber,
+        displayName: inheritedDisplayName,
+      },
+      select: { id: true },
+    });
+    versionRowId = versionRow.id;
+  }
+
+  // Insert one row per change
+  const editRows = changes.map((c) => ({
+    documentId,
+    versionId: versionRowId,
+    changeId: c.id,
+    delWId: c.delId ?? null,
+    insWId: c.insId ?? null,
+    deletedText: c.deletedText,
+    insertedText: c.insertedText,
+    contextBefore: c.contextBefore ?? "",
+    contextAfter: c.contextAfter ?? "",
+    status: "pending" as const,
+  }));
+  // createMany doesn't return rows, so we insert individually for the IDs
+  const insertedEdits = [];
+  for (const row of editRows) {
+    const inserted = await prisma.documentEdit.create({
+      data: row,
+      select: {
+        id: true,
+        changeId: true,
+        delWId: true,
+        insWId: true,
+        deletedText: true,
+        insertedText: true,
+        contextBefore: true,
+        contextAfter: true,
+      },
+    });
+    insertedEdits.push(inserted);
+  }
+
+  await prisma.document.update({
+    where: { id: documentId },
+    data: { currentVersionId: versionRowId },
+  });
+
+  const annotations: EditAnnotation[] = insertedEdits.map((r) => {
+    const src = changes.find((c) => c.id === r.changeId);
     return {
-        ok: true,
-        version_id: versionRowId,
-        version_number: nextVersionNumber,
-        storage_path: newPath,
-        download_url: permalink,
-        annotations,
-        errors,
+      kind: "edit",
+      edit_id: r.id,
+      document_id: documentId,
+      version_id: versionRowId,
+      version_number: nextVersionNumber,
+      change_id: r.changeId,
+      del_w_id: src?.delId,
+      ins_w_id: src?.insId,
+      deleted_text: r.deletedText ?? "",
+      inserted_text: r.insertedText ?? "",
+      context_before: r.contextBefore ?? "",
+      context_after: r.contextAfter ?? "",
+      reason: src?.reason,
+      status: "pending",
     };
+  });
+
+  // Persistent, non-expiring permalink. The backend streams fresh bytes
+  // on each request, so this URL stays valid as long as the file exists.
+  const permalink = buildDownloadUrl(newPath, doc.filename as string);
+
+  return {
+    ok: true,
+    version_id: versionRowId,
+    version_number: nextVersionNumber,
+    storage_path: newPath,
+    download_url: permalink,
+    annotations,
+    errors,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1453,149 +1348,144 @@ export async function runEditDocument(params: {
 // ---------------------------------------------------------------------------
 
 async function readDocumentContent(
-    docLabel: string,
-    docStore: DocStore,
-    write: (s: string) => void,
-    docIndex?: DocIndex,
-    opts?: { emitEvents?: boolean },
+  docLabel: string,
+  docStore: DocStore,
+  write: (s: string) => void,
+  docIndex?: DocIndex,
+  opts?: { emitEvents?: boolean },
 ): Promise<string> {
-    const emitEvents = opts?.emitEvents ?? true;
-    logger.info(`[read_document] called with docLabel="${docLabel}"`);
-    const docInfo = docStore.get(docLabel);
-    if (!docInfo) {
+  const emitEvents = opts?.emitEvents ?? true;
+  logger.info(`[read_document] called with docLabel="${docLabel}"`);
+  const docInfo = docStore.get(docLabel);
+  if (!docInfo) {
+    logger.info(
+      { docLabel, knownLabels: Array.from(docStore.keys()) },
+      `[read_document] MISS — docLabel not in docStore`,
+    );
+    return "Document not found.";
+  }
+  logger.info(
+    `[read_document] docInfo: filename="${docInfo.filename}", file_type="${docInfo.file_type}", storage_path="${docInfo.storage_path}"`,
+  );
+
+  const documentId = docIndex?.[docLabel]?.document_id;
+  const emitDocRead = () => {
+    if (!emitEvents) return;
+    write(
+      `data: ${JSON.stringify({
+        type: "doc_read",
+        filename: docInfo.filename,
+        document_id: documentId,
+      })}\n\n`,
+    );
+  };
+  if (emitEvents)
+    write(
+      `data: ${JSON.stringify({
+        type: "doc_read_start",
+        filename: docInfo.filename,
+        document_id: documentId,
+      })}\n\n`,
+    );
+  try {
+    // Prefer the current tracked-changes version (if any) so read_document
+    // reflects accepted/pending edits rather than the original upload.
+    let raw: ArrayBuffer | null = null;
+    let sourcePath = docInfo.storage_path;
+    if (documentId) {
+      const current = await loadCurrentVersionBytes(documentId);
+      if (current) {
+        raw = current.bytes.buffer.slice(
+          current.bytes.byteOffset,
+          current.bytes.byteOffset + current.bytes.byteLength,
+        ) as ArrayBuffer;
+        sourcePath = current.storage_path;
         logger.info(
-            { docLabel, knownLabels: Array.from(docStore.keys()) },
-            `[read_document] MISS — docLabel not in docStore`,
+          `[read_document] using current version path="${sourcePath}" (bytes=${raw.byteLength})`,
         );
-        return "Document not found.";
+      } else {
+        logger.info(
+          `[read_document] loadCurrentVersionBytes returned null for documentId="${documentId}", falling back to original storage_path`,
+        );
+      }
+    }
+    if (!raw) {
+      raw = await downloadFile(docInfo.storage_path);
+      if (raw) {
+        logger.info(
+          `[read_document] fallback download from storage_path="${docInfo.storage_path}" (bytes=${raw.byteLength})`,
+        );
+      }
+    }
+    if (!raw) {
+      logger.info(
+        `[read_document] FAILED to download any bytes for docLabel="${docLabel}" (tried path="${sourcePath}")`,
+      );
+      emitDocRead();
+      return "Document could not be read.";
+    }
+    // Log the first 8 bytes so we can identify real file format regardless
+    // of the declared file_type. Valid .docx starts with "PK\x03\x04"
+    // (zip). Legacy .doc starts with "\xD0\xCF\x11\xE0" (OLE/CFB).
+    // %PDF-1 is a PDF even if mislabeled. Truncated uploads show as all-zero.
+    {
+      const head = Buffer.from(raw).subarray(0, 8);
+      const hex = head.toString("hex");
+      const ascii = head.toString("binary").replace(/[^\x20-\x7e]/g, ".");
+      logger.info(
+        `[read_document] magic bytes hex=${hex} ascii="${ascii}" for filename="${docInfo.filename}"`,
+      );
+    }
+    let text: string;
+    if (docInfo.file_type === "pdf") {
+      text = await extractPdfText(raw);
+      logger.info(
+        `[read_document] pdf extracted length=${text.length} for filename="${docInfo.filename}"`,
+      );
+    } else if (docInfo.file_type === "docx") {
+      // Use the same flattening as the edit_document matcher so the
+      // LLM sees exactly the characters it can anchor against.
+      text = await extractDocxBodyText(Buffer.from(raw));
+      logger.info(
+        `[read_document] docx extractDocxBodyText length=${text.length} for filename="${docInfo.filename}"`,
+      );
+      if (!text) {
+        logger.info(
+          `[read_document] docx accepted-view extractor returned empty, falling back to mammoth for filename="${docInfo.filename}"`,
+        );
+        const mammoth = await import("mammoth");
+        const result = await mammoth.extractRawText({
+          buffer: Buffer.from(raw),
+        });
+        text = result.value;
+        logger.info(
+          `[read_document] docx mammoth fallback length=${text.length} for filename="${docInfo.filename}"`,
+        );
+      }
+    } else {
+      logger.info(
+        `[read_document] unknown file_type="${docInfo.file_type}" for filename="${docInfo.filename}", trying mammoth`,
+      );
+      const mammoth = await import("mammoth");
+      const result = await mammoth.extractRawText({
+        buffer: Buffer.from(raw),
+      });
+      text = result.value;
+      logger.info(
+        `[read_document] mammoth length=${text.length} for filename="${docInfo.filename}"`,
+      );
     }
     logger.info(
-        `[read_document] docInfo: filename="${docInfo.filename}", file_type="${docInfo.file_type}", storage_path="${docInfo.storage_path}"`,
+      `[read_document] DONE filename="${docInfo.filename}" finalTextLength=${text.length} firstChars=${JSON.stringify(text.slice(0, 120))}`,
     );
-
-    const documentId = docIndex?.[docLabel]?.document_id;
-    const emitDocRead = () => {
-        if (!emitEvents) return;
-        write(
-            `data: ${JSON.stringify({
-                type: "doc_read",
-                filename: docInfo.filename,
-                document_id: documentId,
-            })}\n\n`,
-        );
-    };
+    emitDocRead();
+    return text;
+  } catch (err) {
+    logger.error({ err, docLabel, filename: docInfo.filename }, "[read_document] THREW");
     if (emitEvents)
-        write(
-            `data: ${JSON.stringify({
-                type: "doc_read_start",
-                filename: docInfo.filename,
-                document_id: documentId,
-            })}\n\n`,
-        );
-    try {
-        // Prefer the current tracked-changes version (if any) so read_document
-        // reflects accepted/pending edits rather than the original upload.
-        let raw: ArrayBuffer | null = null;
-        let sourcePath = docInfo.storage_path;
-        if (documentId) {
-            const current = await loadCurrentVersionBytes(documentId);
-            if (current) {
-                raw = current.bytes.buffer.slice(
-                    current.bytes.byteOffset,
-                    current.bytes.byteOffset + current.bytes.byteLength,
-                ) as ArrayBuffer;
-                sourcePath = current.storage_path;
-                logger.info(
-                    `[read_document] using current version path="${sourcePath}" (bytes=${raw.byteLength})`,
-                );
-            } else {
-                logger.info(
-                    `[read_document] loadCurrentVersionBytes returned null for documentId="${documentId}", falling back to original storage_path`,
-                );
-            }
-        }
-        if (!raw) {
-            raw = await downloadFile(docInfo.storage_path);
-            if (raw) {
-                logger.info(
-                    `[read_document] fallback download from storage_path="${docInfo.storage_path}" (bytes=${raw.byteLength})`,
-                );
-            }
-        }
-        if (!raw) {
-            logger.info(
-                `[read_document] FAILED to download any bytes for docLabel="${docLabel}" (tried path="${sourcePath}")`,
-            );
-            emitDocRead();
-            return "Document could not be read.";
-        }
-        // Log the first 8 bytes so we can identify real file format regardless
-        // of the declared file_type. Valid .docx starts with "PK\x03\x04"
-        // (zip). Legacy .doc starts with "\xD0\xCF\x11\xE0" (OLE/CFB).
-        // %PDF-1 is a PDF even if mislabeled. Truncated uploads show as all-zero.
-        {
-            const head = Buffer.from(raw).subarray(0, 8);
-            const hex = head.toString("hex");
-            const ascii = head.toString("binary").replace(/[^\x20-\x7e]/g, ".");
-            logger.info(
-                `[read_document] magic bytes hex=${hex} ascii="${ascii}" for filename="${docInfo.filename}"`,
-            );
-        }
-        let text: string;
-        if (docInfo.file_type === "pdf") {
-            text = await extractPdfText(raw);
-            logger.info(
-                `[read_document] pdf extracted length=${text.length} for filename="${docInfo.filename}"`,
-            );
-        } else if (docInfo.file_type === "docx") {
-            // Use the same flattening as the edit_document matcher so the
-            // LLM sees exactly the characters it can anchor against.
-            text = await extractDocxBodyText(Buffer.from(raw));
-            logger.info(
-                `[read_document] docx extractDocxBodyText length=${text.length} for filename="${docInfo.filename}"`,
-            );
-            if (!text) {
-                logger.info(
-                    `[read_document] docx accepted-view extractor returned empty, falling back to mammoth for filename="${docInfo.filename}"`,
-                );
-                const mammoth = await import("mammoth");
-                const result = await mammoth.extractRawText({
-                    buffer: Buffer.from(raw),
-                });
-                text = result.value;
-                logger.info(
-                    `[read_document] docx mammoth fallback length=${text.length} for filename="${docInfo.filename}"`,
-                );
-            }
-        } else {
-            logger.info(
-                `[read_document] unknown file_type="${docInfo.file_type}" for filename="${docInfo.filename}", trying mammoth`,
-            );
-            const mammoth = await import("mammoth");
-            const result = await mammoth.extractRawText({
-                buffer: Buffer.from(raw),
-            });
-            text = result.value;
-            logger.info(
-                `[read_document] mammoth length=${text.length} for filename="${docInfo.filename}"`,
-            );
-        }
-        logger.info(
-            `[read_document] DONE filename="${docInfo.filename}" finalTextLength=${text.length} firstChars=${JSON.stringify(text.slice(0, 120))}`,
-        );
-        emitDocRead();
-        return text;
-    } catch (err) {
-        logger.error(
-            { err, docLabel, filename: docInfo.filename },
-            "[read_document] THREW",
-        );
-        if (emitEvents)
-            write(
-                `data: ${JSON.stringify({ type: "doc_read", filename: docInfo.filename })}\n\n`,
-            );
-        return "Document could not be read.";
-    }
+      write(`data: ${JSON.stringify({ type: "doc_read", filename: docInfo.filename })}\n\n`);
+    return "Document could not be read.";
+  }
 }
 
 /**
@@ -1606,28 +1496,28 @@ async function readDocumentContent(
  * exact original excerpt.
  */
 function normalizeWithMap(text: string): { norm: string; origIdx: number[] } {
-    const norm: string[] = [];
-    const origIdx: number[] = [];
-    let prevSpace = false;
-    for (let i = 0; i < text.length; i++) {
-        const ch = text[i];
-        if (/\s/.test(ch)) {
-            if (!prevSpace) {
-                norm.push(" ");
-                origIdx.push(i);
-                prevSpace = true;
-            }
-        } else {
-            norm.push(ch.toLowerCase());
-            origIdx.push(i);
-            prevSpace = false;
-        }
+  const norm: string[] = [];
+  const origIdx: number[] = [];
+  let prevSpace = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (/\s/.test(ch)) {
+      if (!prevSpace) {
+        norm.push(" ");
+        origIdx.push(i);
+        prevSpace = true;
+      }
+    } else {
+      norm.push(ch.toLowerCase());
+      origIdx.push(i);
+      prevSpace = false;
     }
-    return { norm: norm.join(""), origIdx };
+  }
+  return { norm: norm.join(""), origIdx };
 }
 
 function normalizeQuery(q: string): string {
-    return q.trim().replace(/\s+/g, " ").toLowerCase();
+  return q.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
 /**
@@ -1635,932 +1525,817 @@ function normalizeQuery(q: string): string {
  * hits, each containing the original-text excerpt plus surrounding context.
  */
 async function findInDocumentContent(params: {
-    docLabel: string;
-    query: string;
-    maxResults?: number;
-    contextChars?: number;
-    docStore: DocStore;
-    write: (s: string) => void;
-    docIndex?: DocIndex;
+  docLabel: string;
+  query: string;
+  maxResults?: number;
+  contextChars?: number;
+  docStore: DocStore;
+  write: (s: string) => void;
+  docIndex?: DocIndex;
 }): Promise<string> {
-    const {
-        docLabel,
-        query,
-        maxResults = 20,
-        contextChars = 80,
-        docStore,
-        write,
-        docIndex,
-    } = params;
+  const { docLabel, query, maxResults = 20, contextChars = 80, docStore, write, docIndex } = params;
 
-    if (!query || !query.trim()) {
-        return JSON.stringify({ ok: false, error: "Empty query." });
-    }
+  if (!query || !query.trim()) {
+    return JSON.stringify({ ok: false, error: "Empty query." });
+  }
 
-    const docInfo = docStore.get(docLabel);
-    if (!docInfo) {
-        return JSON.stringify({
-            ok: false,
-            error: `Document '${docLabel}' not found.`,
-        });
-    }
-
-    // Announce the search to the UI, then reuse readDocumentContent for its
-    // fallbacks — but suppress its own doc_read events so the user only sees
-    // the doc_find block (not a competing doc_read block for the same op).
-    write(
-        `data: ${JSON.stringify({
-            type: "doc_find_start",
-            filename: docInfo.filename,
-            query,
-        })}\n\n`,
-    );
-
-    const text = await readDocumentContent(
-        docLabel,
-        docStore,
-        write,
-        docIndex,
-        { emitEvents: false },
-    );
-    if (!text || text === "Document could not be read.") {
-        write(
-            `data: ${JSON.stringify({
-                type: "doc_find",
-                filename: docInfo.filename,
-                query,
-                total_matches: 0,
-            })}\n\n`,
-        );
-        return JSON.stringify({
-            ok: false,
-            filename: docInfo.filename,
-            error: "Document could not be read.",
-        });
-    }
-
-    const { norm, origIdx } = normalizeWithMap(text);
-    const needle = normalizeQuery(query);
-    if (!needle) {
-        return JSON.stringify({
-            ok: false,
-            error: "Empty query after normalization.",
-        });
-    }
-
-    type Hit = {
-        index: number;
-        excerpt: string;
-        context: string;
-    };
-    const hits: Hit[] = [];
-    let from = 0;
-    while (from <= norm.length - needle.length && hits.length < maxResults) {
-        const pos = norm.indexOf(needle, from);
-        if (pos < 0) break;
-        const endNormPos = pos + needle.length;
-        const origStart = origIdx[pos] ?? 0;
-        const origEnd =
-            endNormPos - 1 < origIdx.length
-                ? origIdx[endNormPos - 1] + 1
-                : text.length;
-        const ctxStart = Math.max(0, origStart - contextChars);
-        const ctxEnd = Math.min(text.length, origEnd + contextChars);
-        hits.push({
-            index: hits.length,
-            excerpt: text.slice(origStart, origEnd),
-            context:
-                (ctxStart > 0 ? "…" : "") +
-                text.slice(ctxStart, ctxEnd).replace(/\s+/g, " ").trim() +
-                (ctxEnd < text.length ? "…" : ""),
-        });
-        from = pos + Math.max(1, needle.length);
-    }
-
-    // Count total occurrences beyond the cap so the model knows whether to narrow the query.
-    let totalMatches = hits.length;
-    if (hits.length >= maxResults) {
-        let probe = from;
-        while (probe <= norm.length - needle.length) {
-            const pos = norm.indexOf(needle, probe);
-            if (pos < 0) break;
-            totalMatches++;
-            probe = pos + Math.max(1, needle.length);
-        }
-    }
-
-    write(
-        `data: ${JSON.stringify({
-            type: "doc_find",
-            filename: docInfo.filename,
-            query,
-            total_matches: totalMatches,
-        })}\n\n`,
-    );
-
+  const docInfo = docStore.get(docLabel);
+  if (!docInfo) {
     return JSON.stringify({
-        ok: true,
+      ok: false,
+      error: `Document '${docLabel}' not found.`,
+    });
+  }
+
+  // Announce the search to the UI, then reuse readDocumentContent for its
+  // fallbacks — but suppress its own doc_read events so the user only sees
+  // the doc_find block (not a competing doc_read block for the same op).
+  write(
+    `data: ${JSON.stringify({
+      type: "doc_find_start",
+      filename: docInfo.filename,
+      query,
+    })}\n\n`,
+  );
+
+  const text = await readDocumentContent(docLabel, docStore, write, docIndex, {
+    emitEvents: false,
+  });
+  if (!text || text === "Document could not be read.") {
+    write(
+      `data: ${JSON.stringify({
+        type: "doc_find",
         filename: docInfo.filename,
         query,
-        total_matches: totalMatches,
-        returned: hits.length,
-        truncated: totalMatches > hits.length,
-        hits,
+        total_matches: 0,
+      })}\n\n`,
+    );
+    return JSON.stringify({
+      ok: false,
+      filename: docInfo.filename,
+      error: "Document could not be read.",
     });
+  }
+
+  const { norm, origIdx } = normalizeWithMap(text);
+  const needle = normalizeQuery(query);
+  if (!needle) {
+    return JSON.stringify({
+      ok: false,
+      error: "Empty query after normalization.",
+    });
+  }
+
+  type Hit = {
+    index: number;
+    excerpt: string;
+    context: string;
+  };
+  const hits: Hit[] = [];
+  let from = 0;
+  while (from <= norm.length - needle.length && hits.length < maxResults) {
+    const pos = norm.indexOf(needle, from);
+    if (pos < 0) break;
+    const endNormPos = pos + needle.length;
+    const origStart = origIdx[pos] ?? 0;
+    const origEnd = endNormPos - 1 < origIdx.length ? origIdx[endNormPos - 1] + 1 : text.length;
+    const ctxStart = Math.max(0, origStart - contextChars);
+    const ctxEnd = Math.min(text.length, origEnd + contextChars);
+    hits.push({
+      index: hits.length,
+      excerpt: text.slice(origStart, origEnd),
+      context:
+        (ctxStart > 0 ? "…" : "") +
+        text.slice(ctxStart, ctxEnd).replace(/\s+/g, " ").trim() +
+        (ctxEnd < text.length ? "…" : ""),
+    });
+    from = pos + Math.max(1, needle.length);
+  }
+
+  // Count total occurrences beyond the cap so the model knows whether to narrow the query.
+  let totalMatches = hits.length;
+  if (hits.length >= maxResults) {
+    let probe = from;
+    while (probe <= norm.length - needle.length) {
+      const pos = norm.indexOf(needle, probe);
+      if (pos < 0) break;
+      totalMatches++;
+      probe = pos + Math.max(1, needle.length);
+    }
+  }
+
+  write(
+    `data: ${JSON.stringify({
+      type: "doc_find",
+      filename: docInfo.filename,
+      query,
+      total_matches: totalMatches,
+    })}\n\n`,
+  );
+
+  return JSON.stringify({
+    ok: true,
+    filename: docInfo.filename,
+    query,
+    total_matches: totalMatches,
+    returned: hits.length,
+    truncated: totalMatches > hits.length,
+    hits,
+  });
 }
 
 export type DocEditedResult = {
-    filename: string;
-    document_id: string;
-    version_id: string;
-    version_number: number | null;
-    download_url: string;
-    annotations: EditAnnotation[];
+  filename: string;
+  document_id: string;
+  version_id: string;
+  version_number: number | null;
+  download_url: string;
+  annotations: EditAnnotation[];
 };
 
 export type TurnEditState = Map<
-    string,
-    { versionId: string; versionNumber: number; storagePath: string }
+  string,
+  { versionId: string; versionNumber: number; storagePath: string }
 >;
 
 export type DocCreatedResult = {
-    filename: string;
-    download_url: string;
-    document_id?: string;
-    version_id?: string;
-    version_number?: number | null;
+  filename: string;
+  download_url: string;
+  document_id?: string;
+  version_id?: string;
+  version_number?: number | null;
 };
 
 export type DocReplicatedResult = {
-    /** Filename of the source document being copied. */
-    filename: string;
-    /** How many copies were produced in this single tool call. */
-    count: number;
-    /** One entry per new copy. */
-    copies: {
-        new_filename: string;
-        document_id: string;
-        version_id: string;
-    }[];
+  /** Filename of the source document being copied. */
+  filename: string;
+  /** How many copies were produced in this single tool call. */
+  count: number;
+  /** One entry per new copy. */
+  copies: {
+    new_filename: string;
+    document_id: string;
+    version_id: string;
+  }[];
 };
 
 export async function runToolCalls(
-    toolCalls: ToolCall[],
-    docStore: DocStore,
-    userId: string,
-    write: (s: string) => void,
-    workflowStore?: WorkflowStore,
-    tabularStore?: TabularCellStore,
-    docIndex?: DocIndex,
-    turnEditState?: TurnEditState,
-    projectId?: string | null,
+  toolCalls: ToolCall[],
+  docStore: DocStore,
+  userId: string,
+  write: (s: string) => void,
+  workflowStore?: WorkflowStore,
+  tabularStore?: TabularCellStore,
+  docIndex?: DocIndex,
+  turnEditState?: TurnEditState,
+  projectId?: string | null,
 ): Promise<{
-    toolResults: unknown[];
-    docsRead: { filename: string; document_id?: string }[];
-    docsFound: { filename: string; query: string; total_matches: number }[];
-    docsCreated: DocCreatedResult[];
-    docsReplicated: DocReplicatedResult[];
-    workflowsApplied: { workflow_id: string; title: string }[];
-    docsEdited: DocEditedResult[];
+  toolResults: unknown[];
+  docsRead: { filename: string; document_id?: string }[];
+  docsFound: { filename: string; query: string; total_matches: number }[];
+  docsCreated: DocCreatedResult[];
+  docsReplicated: DocReplicatedResult[];
+  workflowsApplied: { workflow_id: string; title: string }[];
+  docsEdited: DocEditedResult[];
 }> {
-    const toolResults: unknown[] = [];
-    const docsRead: { filename: string; document_id?: string }[] = [];
-    const docsFound: {
-        filename: string;
-        query: string;
-        total_matches: number;
-    }[] = [];
-    const docsCreated: DocCreatedResult[] = [];
-    const docsReplicated: DocReplicatedResult[] = [];
-    const workflowsApplied: { workflow_id: string; title: string }[] = [];
-    const docsEdited: DocEditedResult[] = [];
+  const toolResults: unknown[] = [];
+  const docsRead: { filename: string; document_id?: string }[] = [];
+  const docsFound: {
+    filename: string;
+    query: string;
+    total_matches: number;
+  }[] = [];
+  const docsCreated: DocCreatedResult[] = [];
+  const docsReplicated: DocReplicatedResult[] = [];
+  const workflowsApplied: { workflow_id: string; title: string }[] = [];
+  const docsEdited: DocEditedResult[] = [];
 
-    for (const tc of toolCalls) {
-        let args: Record<string, unknown> = {};
-        try {
-            args = JSON.parse(tc.function.arguments || "{}");
-        } catch {
-            /* ignore */
-        }
-
-        if (tc.function.name === "read_document") {
-            const rawDocId = args.doc_id as string;
-            const docId =
-                resolveDocLabel(rawDocId, docStore, docIndex) ?? rawDocId;
-            const content = await readDocumentContent(
-                docId,
-                docStore,
-                write,
-                docIndex,
-            );
-            const filename = docStore.get(docId)?.filename;
-            const documentId = docIndex?.[docId]?.document_id;
-            if (filename) docsRead.push({ filename, document_id: documentId });
-            toolResults.push({
-                role: "tool",
-                tool_call_id: tc.id,
-                content: filename
-                    ? `${citationReminder(docId, filename)}\n\n${content}`
-                    : content,
-            });
-        } else if (tc.function.name === "find_in_document") {
-            const rawDocId = args.doc_id as string;
-            const docId =
-                resolveDocLabel(rawDocId, docStore, docIndex) ?? rawDocId;
-            const query = (args.query as string) ?? "";
-            const maxResults =
-                typeof args.max_results === "number"
-                    ? args.max_results
-                    : undefined;
-            const contextChars =
-                typeof args.context_chars === "number"
-                    ? args.context_chars
-                    : undefined;
-            const content = await findInDocumentContent({
-                docLabel: docId,
-                query,
-                maxResults,
-                contextChars,
-                docStore,
-                write,
-                docIndex,
-            });
-            const filename = docStore.get(docId)?.filename;
-            if (filename) {
-                let totalMatches = 0;
-                try {
-                    const parsed = JSON.parse(content) as {
-                        total_matches?: number;
-                    };
-                    totalMatches = parsed.total_matches ?? 0;
-                } catch {
-                    /* ignore — still record the find attempt */
-                }
-                docsFound.push({
-                    filename,
-                    query,
-                    total_matches: totalMatches,
-                });
-            }
-            toolResults.push({ role: "tool", tool_call_id: tc.id, content });
-        } else if (tc.function.name === "list_documents") {
-            const list = Array.from(docStore.entries()).map(
-                ([doc_id, info]) => ({
-                    doc_id,
-                    filename: info.filename,
-                    file_type: info.file_type,
-                }),
-            );
-            toolResults.push({
-                role: "tool",
-                tool_call_id: tc.id,
-                content: JSON.stringify(list),
-            });
-        } else if (tc.function.name === "fetch_documents") {
-            const rawDocIds = (args.doc_ids as string[]) ?? [];
-            const docIds = rawDocIds.map(
-                (id) => resolveDocLabel(id, docStore, docIndex) ?? id,
-            );
-            const parts: string[] = [];
-            for (const docId of docIds) {
-                const content = await readDocumentContent(
-                    docId,
-                    docStore,
-                    write,
-                    docIndex,
-                );
-                const filename = docStore.get(docId)?.filename ?? docId;
-                parts.push(
-                    `--- ${filename} (${docId}) ---\n${citationReminder(docId, filename)}\n\n${content}`,
-                );
-                if (docStore.get(docId)) {
-                    const documentId = docIndex?.[docId]?.document_id;
-                    docsRead.push({ filename, document_id: documentId });
-                }
-            }
-            toolResults.push({
-                role: "tool",
-                tool_call_id: tc.id,
-                content: parts.join("\n\n"),
-            });
-        } else if (tc.function.name === "list_workflows") {
-            const list = workflowStore
-                ? Array.from(workflowStore.entries()).map(([id, w]) => ({
-                      id,
-                      title: w.title,
-                  }))
-                : [];
-            toolResults.push({
-                role: "tool",
-                tool_call_id: tc.id,
-                content: JSON.stringify(list),
-            });
-        } else if (tc.function.name === "read_workflow") {
-            const wfId = args.workflow_id as string;
-            const wf = workflowStore?.get(wfId);
-            if (wf) {
-                write(
-                    `data: ${JSON.stringify({ type: "workflow_applied", workflow_id: wfId, title: wf.title })}\n\n`,
-                );
-                workflowsApplied.push({ workflow_id: wfId, title: wf.title });
-            }
-            toolResults.push({
-                role: "tool",
-                tool_call_id: tc.id,
-                content: wf ? wf.prompt_md : `Workflow '${wfId}' not found.`,
-            });
-        } else if (tc.function.name === "read_table_cells" && tabularStore) {
-            const colIndices = args.col_indices as number[] | undefined;
-            const rowIndices = args.row_indices as number[] | undefined;
-
-            const filteredCols = colIndices?.length
-                ? tabularStore.columns.filter((_, i) => colIndices.includes(i))
-                : tabularStore.columns;
-            const filteredDocs = rowIndices?.length
-                ? tabularStore.documents.filter((_, i) =>
-                      rowIndices.includes(i),
-                  )
-                : tabularStore.documents;
-
-            const label = `${filteredCols.length} ${filteredCols.length === 1 ? "column" : "columns"} × ${filteredDocs.length} ${filteredDocs.length === 1 ? "row" : "rows"}`;
-            write(
-                `data: ${JSON.stringify({ type: "doc_read_start", filename: label })}\n\n`,
-            );
-
-            const lines: string[] = [];
-            for (const col of filteredCols) {
-                const colPos = tabularStore.columns.findIndex(
-                    (c) => c.index === col.index,
-                );
-                for (const doc of filteredDocs) {
-                    const rowPos = tabularStore.documents.findIndex(
-                        (d) => d.id === doc.id,
-                    );
-                    const cell = tabularStore.cells.get(
-                        `${col.index}:${doc.id}`,
-                    );
-                    lines.push(
-                        `[COL:${colPos} "${col.name}" | ROW:${rowPos} "${doc.filename}"]`,
-                    );
-                    if (cell?.summary) {
-                        lines.push(`Summary: ${cell.summary}`);
-                        if (cell.flag) lines.push(`Flag: ${cell.flag}`);
-                        if (cell.reasoning)
-                            lines.push(`Reasoning: ${cell.reasoning}`);
-                    } else {
-                        lines.push(`(not yet generated)`);
-                    }
-                    lines.push("");
-                }
-            }
-
-            write(
-                `data: ${JSON.stringify({ type: "doc_read", filename: label })}\n\n`,
-            );
-            docsRead.push({ filename: label });
-            toolResults.push({
-                role: "tool",
-                tool_call_id: tc.id,
-                content: lines.join("\n") || "No cells found.",
-            });
-        } else if (tc.function.name === "edit_document" && docIndex) {
-            const rawDocId = args.doc_id as string;
-            const editsRaw = args.edits as unknown[] | undefined;
-            const docId =
-                resolveDocLabel(rawDocId, docStore, docIndex) ?? rawDocId;
-            const docInfo = docStore.get(docId);
-            const indexed = docIndex?.[docId];
-
-            const emitEditError = (
-                filename: string,
-                documentId: string,
-                error: string,
-            ) => {
-                // Surface the failure as a failed "Edited" block in the UI
-                // (start → done-with-error) so it matches the shape the
-                // success/late-failure paths already use.
-                write(
-                    `data: ${JSON.stringify({
-                        type: "doc_edited_start",
-                        filename,
-                    })}\n\n`,
-                );
-                write(
-                    `data: ${JSON.stringify({
-                        type: "doc_edited",
-                        filename,
-                        document_id: documentId,
-                        version_id: "",
-                        download_url: "",
-                        annotations: [],
-                        error,
-                    })}\n\n`,
-                );
-            };
-
-            if (!docInfo || !indexed) {
-                const err = `Document '${docId}' not found in this chat's attachments.`;
-                emitEditError(docId, indexed?.document_id ?? "", err);
-                toolResults.push({
-                    role: "tool",
-                    tool_call_id: tc.id,
-                    content: JSON.stringify({ error: err }),
-                });
-            } else if (!Array.isArray(editsRaw) || editsRaw.length === 0) {
-                const err = "edits array is required and must not be empty.";
-                emitEditError(docInfo.filename, indexed.document_id, err);
-                toolResults.push({
-                    role: "tool",
-                    tool_call_id: tc.id,
-                    content: JSON.stringify({ error: err }),
-                });
-            } else if (docInfo.file_type !== "docx") {
-                const err = "edit_document only supports .docx files.";
-                emitEditError(docInfo.filename, indexed.document_id, err);
-                toolResults.push({
-                    role: "tool",
-                    tool_call_id: tc.id,
-                    content: JSON.stringify({ error: err }),
-                });
-            } else {
-                write(
-                    `data: ${JSON.stringify({
-                        type: "doc_edited_start",
-                        filename: docInfo.filename,
-                    })}\n\n`,
-                );
-                const edits: EditInput[] = (
-                    editsRaw as Record<string, unknown>[]
-                ).map((e) => ({
-                    find: String(e.find ?? ""),
-                    replace: String(e.replace ?? ""),
-                    context_before: String(e.context_before ?? ""),
-                    context_after: String(e.context_after ?? ""),
-                    reason: e.reason ? String(e.reason) : undefined,
-                }));
-                const reuseVersion = turnEditState?.get(indexed.document_id);
-                const result = await runEditDocument({
-                    documentId: indexed.document_id,
-                    userId,
-                    edits,
-                    reuseVersion,
-                });
-
-                if (result.ok) {
-                    turnEditState?.set(indexed.document_id, {
-                        versionId: result.version_id,
-                        versionNumber: result.version_number,
-                        storagePath: result.storage_path,
-                    });
-                    // Keep the chat-local doc label pointed at the latest
-                    // edited version so any follow-up read_document call in
-                    // the same assistant turn reads and cites the same bytes.
-                    if (docIndex[docId]) {
-                        docIndex[docId] = {
-                            ...docIndex[docId],
-                            version_id: result.version_id,
-                            version_number: result.version_number,
-                        };
-                    }
-                    const currentDocStore = docStore.get(docId);
-                    if (currentDocStore) {
-                        docStore.set(docId, {
-                            ...currentDocStore,
-                            storage_path: result.storage_path,
-                        });
-                    }
-                    const payload: DocEditedResult = {
-                        filename: docInfo.filename,
-                        document_id: indexed.document_id,
-                        version_id: result.version_id,
-                        version_number: result.version_number,
-                        download_url: result.download_url,
-                        annotations: result.annotations,
-                    };
-                    docsEdited.push(payload);
-                    write(
-                        `data: ${JSON.stringify({
-                            type: "doc_edited",
-                            ...payload,
-                        })}\n\n`,
-                    );
-                    toolResults.push({
-                        role: "tool",
-                        tool_call_id: tc.id,
-                        content: JSON.stringify({
-                            ok: true,
-                            doc_id: docId,
-                            document_id: indexed.document_id,
-                            version_id: result.version_id,
-                            version_number: result.version_number,
-                            applied: result.annotations.length,
-                            errors: result.errors,
-                        }),
-                    });
-                } else {
-                    write(
-                        `data: ${JSON.stringify({
-                            type: "doc_edited",
-                            filename: docInfo.filename,
-                            document_id: indexed.document_id,
-                            version_id: "",
-                            download_url: "",
-                            annotations: [],
-                            error: result.error,
-                        })}\n\n`,
-                    );
-                    toolResults.push({
-                        role: "tool",
-                        tool_call_id: tc.id,
-                        content: JSON.stringify({
-                            ok: false,
-                            error: result.error,
-                        }),
-                    });
-                }
-            }
-        } else if (tc.function.name === "replicate_document" && docIndex) {
-            const rawDocId = args.doc_id as string;
-            const requestedFilename =
-                typeof args.new_filename === "string" &&
-                args.new_filename.trim()
-                    ? args.new_filename.trim()
-                    : null;
-            const requestedCount =
-                typeof args.count === "number" && Number.isFinite(args.count)
-                    ? Math.max(1, Math.min(20, Math.floor(args.count)))
-                    : 1;
-            const sourceLabel =
-                resolveDocLabel(rawDocId, docStore, docIndex) ?? rawDocId;
-            const sourceInfo = docStore.get(sourceLabel);
-            const sourceIndexed = docIndex[sourceLabel];
-            const sourceFilename = sourceInfo?.filename ?? rawDocId;
-
-            write(
-                `data: ${JSON.stringify({
-                    type: "doc_replicate_start",
-                    filename: sourceFilename,
-                    count: requestedCount,
-                })}\n\n`,
-            );
-
-            const fail = (error: string) => {
-                write(
-                    `data: ${JSON.stringify({
-                        type: "doc_replicated",
-                        filename: sourceFilename,
-                        count: requestedCount,
-                        copies: [],
-                        error,
-                    })}\n\n`,
-                );
-                toolResults.push({
-                    role: "tool",
-                    tool_call_id: tc.id,
-                    content: JSON.stringify({ ok: false, error }),
-                });
-            };
-
-            if (!sourceInfo || !sourceIndexed) {
-                fail(`Document '${rawDocId}' not found in this project.`);
-            } else if (!projectId) {
-                fail("replicate_document is only available in project chats.");
-            } else {
-                try {
-                    // Pull the active version once — every copy gets the
-                    // same starting bytes (with any accepted tracked
-                    // changes rolled in), no point re-fetching per copy.
-                    const active = await loadActiveVersion(
-                        sourceIndexed.document_id,
-                    );
-                    const sourcePath =
-                        active?.storage_path ?? sourceInfo.storage_path;
-                    const sourcePdfPath = active?.pdf_storage_path ?? null;
-                    const raw = await downloadFile(sourcePath);
-                    const pdfBytes = sourcePdfPath
-                        ? await downloadFile(sourcePdfPath)
-                        : null;
-                    if (!raw) {
-                        fail(
-                            "Could not read the source document's bytes from storage.",
-                        );
-                    } else {
-                        // Build N filenames. With count=1 keep the
-                        // pre-existing "(copy)" suffix; with count>1 use
-                        // numbered "(1)", "(2)" suffixes.
-                        const srcExt =
-                            sourceInfo.filename.match(/\.[^./\\]+$/)?.[0] ?? "";
-                        const baseStem = (() => {
-                            if (requestedFilename) {
-                                return requestedFilename.replace(
-                                    /\.[^./\\]+$/,
-                                    "",
-                                );
-                            }
-                            return sourceInfo.filename.replace(
-                                /\.[^./\\]+$/,
-                                "",
-                            );
-                        })();
-                        const filenames: string[] = [];
-                        for (let n = 1; n <= requestedCount; n++) {
-                            const suffix =
-                                requestedCount === 1
-                                    ? requestedFilename
-                                        ? ""
-                                        : " (copy)"
-                                    : ` (${n})`;
-                            filenames.push(`${baseStem}${suffix}${srcExt}`);
-                        }
-
-                        // Insert N documents — Prisma createMany doesn't return rows,
-                        // so we insert one by one to get IDs.
-                        const newDocs: { id: string; filename: string }[] = [];
-                        for (const fn of filenames) {
-                            const d = await prisma.document.create({
-                                data: {
-                                    projectId: projectId ?? undefined,
-                                    userId,
-                                    filename: fn,
-                                    fileType: sourceInfo.file_type,
-                                    sizeBytes: raw.byteLength,
-                                    status: "ready",
-                                },
-                                select: { id: true, filename: true },
-                            });
-                            newDocs.push(d);
-                        }
-                        if (newDocs.length === 0) {
-                            fail("Failed to record replicated documents");
-                        } else {
-                            const contentType =
-                                sourceInfo.file_type === "pdf"
-                                    ? "application/pdf"
-                                    : "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-
-                            // Parallel uploads: the doc bytes (and PDF
-                            // rendition if any) for every new copy.
-                            const uploadJobs: Promise<unknown>[] = [];
-                            const newKeys: string[] = [];
-                            const newPdfKeys: (string | null)[] = [];
-                            for (const d of newDocs) {
-                                const key = storageKey(
-                                    userId,
-                                    d.id,
-                                    d.filename,
-                                );
-                                newKeys.push(key);
-                                uploadJobs.push(
-                                    uploadFile(key, raw, contentType),
-                                );
-                                if (pdfBytes) {
-                                    const pdfKey = convertedPdfKey(
-                                        userId,
-                                        d.id,
-                                    );
-                                    newPdfKeys.push(pdfKey);
-                                    uploadJobs.push(
-                                        uploadFile(
-                                            pdfKey,
-                                            pdfBytes,
-                                            "application/pdf",
-                                        ),
-                                    );
-                                } else {
-                                    newPdfKeys.push(null);
-                                }
-                            }
-                            await Promise.all(uploadJobs);
-
-                            // Insert N versions — need IDs back.
-                            const versionByDocId = new Map<string, string>();
-                            for (let idx = 0; idx < newDocs.length; idx++) {
-                                const d = newDocs[idx];
-                                const v = await prisma.documentVersion.create({
-                                    data: {
-                                        documentId: d.id,
-                                        storagePath: newKeys[idx],
-                                        pdfStoragePath: newPdfKeys[idx],
-                                        source: "upload",
-                                        versionNumber: 1,
-                                        displayName: d.filename,
-                                    },
-                                    select: { id: true, documentId: true },
-                                });
-                                versionByDocId.set(v.documentId, v.id);
-                            }
-
-                            if (versionByDocId.size !== newDocs.length) {
-                                fail("Failed to record replicated document versions");
-                            } else {
-                                // Update current_version_id for each doc
-                                await Promise.all(
-                                    newDocs.map((d) =>
-                                        prisma.document.update({
-                                            where: { id: d.id },
-                                            data: {
-                                                currentVersionId:
-                                                    versionByDocId.get(d.id),
-                                            },
-                                        }),
-                                    ),
-                                );
-
-                                // Register every copy under a fresh doc-N
-                                // slug so the model can edit/read any of
-                                // them in the same turn.
-                                const existingLabels = new Set(
-                                    Object.keys(docIndex),
-                                );
-                                let nextLabelIdx = 0;
-                                const copies: {
-                                    new_filename: string;
-                                    document_id: string;
-                                    version_id: string;
-                                }[] = [];
-                                const toolPayloadCopies: {
-                                    doc_id: string;
-                                    document_id: string;
-                                    version_id: string;
-                                    filename: string;
-                                    download_url: string;
-                                }[] = [];
-                                for (let idx = 0; idx < newDocs.length; idx++) {
-                                    const d = newDocs[idx];
-                                    const newKey = newKeys[idx];
-                                    const versionId = versionByDocId.get(d.id);
-                                    if (!versionId) continue;
-                                    while (
-                                        existingLabels.has(
-                                            `doc-${nextLabelIdx}`,
-                                        )
-                                    )
-                                        nextLabelIdx++;
-                                    const slug = `doc-${nextLabelIdx}`;
-                                    existingLabels.add(slug);
-                                    docIndex[slug] = {
-                                        document_id: d.id,
-                                        filename: d.filename,
-                                    };
-                                    docStore.set(slug, {
-                                        storage_path: newKey,
-                                        file_type: sourceInfo.file_type,
-                                        filename: d.filename,
-                                    });
-                                    copies.push({
-                                        new_filename: d.filename,
-                                        document_id: d.id,
-                                        version_id: versionId,
-                                    });
-                                    toolPayloadCopies.push({
-                                        doc_id: slug,
-                                        document_id: d.id,
-                                        version_id: versionId,
-                                        filename: d.filename,
-                                        download_url: buildDownloadUrl(
-                                            newKey,
-                                            d.filename,
-                                        ),
-                                    });
-                                }
-
-                                write(
-                                    `data: ${JSON.stringify({
-                                        type: "doc_replicated",
-                                        filename: sourceFilename,
-                                        count: copies.length,
-                                        copies,
-                                    })}\n\n`,
-                                );
-                                docsReplicated.push({
-                                    filename: sourceFilename,
-                                    count: copies.length,
-                                    copies,
-                                });
-                                toolResults.push({
-                                    role: "tool",
-                                    tool_call_id: tc.id,
-                                    content: JSON.stringify({
-                                        ok: true,
-                                        count: copies.length,
-                                        copies: toolPayloadCopies,
-                                    }),
-                                });
-                            }
-                        }
-                    }
-                } catch (e) {
-                    fail(`replicate_document failed: ${String(e)}`);
-                }
-            }
-        } else if (tc.function.name === "generate_docx") {
-            const title = args.title as string;
-            const landscape = !!args.landscape;
-            logger.info(
-                `[generate_docx] title="${title}" landscape=${landscape} args.landscape=${args.landscape}`,
-            );
-            const previewFilename = `${
-                title
-                    .replace(/[^a-zA-Z0-9 _-]/g, "")
-                    .trim()
-                    .slice(0, 64) || "document"
-            }.docx`;
-            write(
-                `data: ${JSON.stringify({ type: "doc_created_start", filename: previewFilename })}\n\n`,
-            );
-            const result = await generateDocx(
-                title,
-                args.sections as unknown[],
-                userId,
-                { landscape, projectId: projectId ?? null },
-            );
-            let newDocLabel: string | null = null;
-            if ("filename" in result && "download_url" in result) {
-                const dlFilename = result.filename as string;
-                const dlUrl = result.download_url as string;
-                const documentId = (result as { document_id?: string })
-                    .document_id;
-                const versionId = (result as { version_id?: string })
-                    .version_id;
-                const versionNumber =
-                    (result as { version_number?: number }).version_number ??
-                    null;
-                const storagePath = (result as { storage_path?: string })
-                    .storage_path;
-
-                // Register the generated doc in the chat context so
-                // edit_document (and read_document / find_in_document)
-                // can act on it within the same assistant turn. New label
-                // is the next free `doc-N` index. Subsequent turns pick
-                // it up via the normal attachment/project doc query.
-                if (documentId && storagePath && docIndex) {
-                    const existingLabels = new Set(Object.keys(docIndex));
-                    let i = 0;
-                    while (existingLabels.has(`doc-${i}`)) i++;
-                    newDocLabel = `doc-${i}`;
-                    docIndex[newDocLabel] = {
-                        document_id: documentId,
-                        filename: dlFilename,
-                    };
-                    docStore.set(newDocLabel, {
-                        storage_path: storagePath,
-                        file_type: "docx",
-                        filename: dlFilename,
-                    });
-                }
-
-                write(
-                    `data: ${JSON.stringify({
-                        type: "doc_created",
-                        filename: dlFilename,
-                        download_url: dlUrl,
-                        document_id: documentId,
-                        version_id: versionId,
-                        version_number: versionNumber,
-                    })}\n\n`,
-                );
-                docsCreated.push({
-                    filename: dlFilename,
-                    download_url: dlUrl,
-                    document_id: documentId,
-                    version_id: versionId,
-                    version_number: versionNumber,
-                });
-            } else {
-                write(
-                    `data: ${JSON.stringify({ type: "doc_created", filename: previewFilename, download_url: "" })}\n\n`,
-                );
-            }
-            // Surface the chat-local doc label in the tool result so the
-            // model can pass it as `doc_id` to edit_document / read_document
-            // / find_in_document in the same turn. Without this the model
-            // only sees the DB UUID, which isn't valid as a doc_id anchor.
-            const { download_url, storage_path, ...safeToolResult } =
-                result as Record<string, unknown>;
-            const toolResultPayload = newDocLabel
-                ? {
-                      ...safeToolResult,
-                      doc_id: newDocLabel,
-                      next_required_action: `Before writing your final response, call read_document with doc_id "${newDocLabel}". Describe and cite the generated document using doc_id "${newDocLabel}", not the source/template document.`,
-                  }
-                : safeToolResult;
-            toolResults.push({
-                role: "tool",
-                tool_call_id: tc.id,
-                content: JSON.stringify(toolResultPayload),
-            });
-        }
+  for (const tc of toolCalls) {
+    let args: Record<string, unknown> = {};
+    try {
+      args = JSON.parse(tc.function.arguments || "{}");
+    } catch {
+      /* ignore */
     }
 
-    return {
-        toolResults,
-        docsRead,
-        docsFound,
-        docsCreated,
-        docsReplicated,
-        workflowsApplied,
-        docsEdited,
-    };
+    if (tc.function.name === "read_document") {
+      const rawDocId = args.doc_id as string;
+      const docId = resolveDocLabel(rawDocId, docStore, docIndex) ?? rawDocId;
+      const content = await readDocumentContent(docId, docStore, write, docIndex);
+      const filename = docStore.get(docId)?.filename;
+      const documentId = docIndex?.[docId]?.document_id;
+      if (filename) docsRead.push({ filename, document_id: documentId });
+      toolResults.push({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: filename ? `${citationReminder(docId, filename)}\n\n${content}` : content,
+      });
+    } else if (tc.function.name === "find_in_document") {
+      const rawDocId = args.doc_id as string;
+      const docId = resolveDocLabel(rawDocId, docStore, docIndex) ?? rawDocId;
+      const query = (args.query as string) ?? "";
+      const maxResults = typeof args.max_results === "number" ? args.max_results : undefined;
+      const contextChars = typeof args.context_chars === "number" ? args.context_chars : undefined;
+      const content = await findInDocumentContent({
+        docLabel: docId,
+        query,
+        maxResults,
+        contextChars,
+        docStore,
+        write,
+        docIndex,
+      });
+      const filename = docStore.get(docId)?.filename;
+      if (filename) {
+        let totalMatches = 0;
+        try {
+          const parsed = JSON.parse(content) as {
+            total_matches?: number;
+          };
+          totalMatches = parsed.total_matches ?? 0;
+        } catch {
+          /* ignore — still record the find attempt */
+        }
+        docsFound.push({
+          filename,
+          query,
+          total_matches: totalMatches,
+        });
+      }
+      toolResults.push({ role: "tool", tool_call_id: tc.id, content });
+    } else if (tc.function.name === "list_documents") {
+      const list = Array.from(docStore.entries()).map(([doc_id, info]) => ({
+        doc_id,
+        filename: info.filename,
+        file_type: info.file_type,
+      }));
+      toolResults.push({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: JSON.stringify(list),
+      });
+    } else if (tc.function.name === "fetch_documents") {
+      const rawDocIds = (args.doc_ids as string[]) ?? [];
+      const docIds = rawDocIds.map((id) => resolveDocLabel(id, docStore, docIndex) ?? id);
+      const parts: string[] = [];
+      for (const docId of docIds) {
+        const content = await readDocumentContent(docId, docStore, write, docIndex);
+        const filename = docStore.get(docId)?.filename ?? docId;
+        parts.push(
+          `--- ${filename} (${docId}) ---\n${citationReminder(docId, filename)}\n\n${content}`,
+        );
+        if (docStore.get(docId)) {
+          const documentId = docIndex?.[docId]?.document_id;
+          docsRead.push({ filename, document_id: documentId });
+        }
+      }
+      toolResults.push({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: parts.join("\n\n"),
+      });
+    } else if (tc.function.name === "list_workflows") {
+      const list = workflowStore
+        ? Array.from(workflowStore.entries()).map(([id, w]) => ({
+            id,
+            title: w.title,
+          }))
+        : [];
+      toolResults.push({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: JSON.stringify(list),
+      });
+    } else if (tc.function.name === "read_workflow") {
+      const wfId = args.workflow_id as string;
+      const wf = workflowStore?.get(wfId);
+      if (wf) {
+        write(
+          `data: ${JSON.stringify({ type: "workflow_applied", workflow_id: wfId, title: wf.title })}\n\n`,
+        );
+        workflowsApplied.push({ workflow_id: wfId, title: wf.title });
+      }
+      toolResults.push({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: wf ? wf.prompt_md : `Workflow '${wfId}' not found.`,
+      });
+    } else if (tc.function.name === "read_table_cells" && tabularStore) {
+      const colIndices = args.col_indices as number[] | undefined;
+      const rowIndices = args.row_indices as number[] | undefined;
+
+      const filteredCols = colIndices?.length
+        ? tabularStore.columns.filter((_, i) => colIndices.includes(i))
+        : tabularStore.columns;
+      const filteredDocs = rowIndices?.length
+        ? tabularStore.documents.filter((_, i) => rowIndices.includes(i))
+        : tabularStore.documents;
+
+      const label = `${filteredCols.length} ${filteredCols.length === 1 ? "column" : "columns"} × ${filteredDocs.length} ${filteredDocs.length === 1 ? "row" : "rows"}`;
+      write(`data: ${JSON.stringify({ type: "doc_read_start", filename: label })}\n\n`);
+
+      const lines: string[] = [];
+      for (const col of filteredCols) {
+        const colPos = tabularStore.columns.findIndex((c) => c.index === col.index);
+        for (const doc of filteredDocs) {
+          const rowPos = tabularStore.documents.findIndex((d) => d.id === doc.id);
+          const cell = tabularStore.cells.get(`${col.index}:${doc.id}`);
+          lines.push(`[COL:${colPos} "${col.name}" | ROW:${rowPos} "${doc.filename}"]`);
+          if (cell?.summary) {
+            lines.push(`Summary: ${cell.summary}`);
+            if (cell.flag) lines.push(`Flag: ${cell.flag}`);
+            if (cell.reasoning) lines.push(`Reasoning: ${cell.reasoning}`);
+          } else {
+            lines.push(`(not yet generated)`);
+          }
+          lines.push("");
+        }
+      }
+
+      write(`data: ${JSON.stringify({ type: "doc_read", filename: label })}\n\n`);
+      docsRead.push({ filename: label });
+      toolResults.push({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: lines.join("\n") || "No cells found.",
+      });
+    } else if (tc.function.name === "edit_document" && docIndex) {
+      const rawDocId = args.doc_id as string;
+      const editsRaw = args.edits as unknown[] | undefined;
+      const docId = resolveDocLabel(rawDocId, docStore, docIndex) ?? rawDocId;
+      const docInfo = docStore.get(docId);
+      const indexed = docIndex?.[docId];
+
+      const emitEditError = (filename: string, documentId: string, error: string) => {
+        // Surface the failure as a failed "Edited" block in the UI
+        // (start → done-with-error) so it matches the shape the
+        // success/late-failure paths already use.
+        write(
+          `data: ${JSON.stringify({
+            type: "doc_edited_start",
+            filename,
+          })}\n\n`,
+        );
+        write(
+          `data: ${JSON.stringify({
+            type: "doc_edited",
+            filename,
+            document_id: documentId,
+            version_id: "",
+            download_url: "",
+            annotations: [],
+            error,
+          })}\n\n`,
+        );
+      };
+
+      if (!docInfo || !indexed) {
+        const err = `Document '${docId}' not found in this chat's attachments.`;
+        emitEditError(docId, indexed?.document_id ?? "", err);
+        toolResults.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: JSON.stringify({ error: err }),
+        });
+      } else if (!Array.isArray(editsRaw) || editsRaw.length === 0) {
+        const err = "edits array is required and must not be empty.";
+        emitEditError(docInfo.filename, indexed.document_id, err);
+        toolResults.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: JSON.stringify({ error: err }),
+        });
+      } else if (docInfo.file_type !== "docx") {
+        const err = "edit_document only supports .docx files.";
+        emitEditError(docInfo.filename, indexed.document_id, err);
+        toolResults.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: JSON.stringify({ error: err }),
+        });
+      } else {
+        write(
+          `data: ${JSON.stringify({
+            type: "doc_edited_start",
+            filename: docInfo.filename,
+          })}\n\n`,
+        );
+        const edits: EditInput[] = (editsRaw as Record<string, unknown>[]).map((e) => ({
+          find: String(e.find ?? ""),
+          replace: String(e.replace ?? ""),
+          context_before: String(e.context_before ?? ""),
+          context_after: String(e.context_after ?? ""),
+          reason: e.reason ? String(e.reason) : undefined,
+        }));
+        const reuseVersion = turnEditState?.get(indexed.document_id);
+        const result = await runEditDocument({
+          documentId: indexed.document_id,
+          userId,
+          edits,
+          reuseVersion,
+        });
+
+        if (result.ok) {
+          turnEditState?.set(indexed.document_id, {
+            versionId: result.version_id,
+            versionNumber: result.version_number,
+            storagePath: result.storage_path,
+          });
+          // Keep the chat-local doc label pointed at the latest
+          // edited version so any follow-up read_document call in
+          // the same assistant turn reads and cites the same bytes.
+          if (docIndex[docId]) {
+            docIndex[docId] = {
+              ...docIndex[docId],
+              version_id: result.version_id,
+              version_number: result.version_number,
+            };
+          }
+          const currentDocStore = docStore.get(docId);
+          if (currentDocStore) {
+            docStore.set(docId, {
+              ...currentDocStore,
+              storage_path: result.storage_path,
+            });
+          }
+          const payload: DocEditedResult = {
+            filename: docInfo.filename,
+            document_id: indexed.document_id,
+            version_id: result.version_id,
+            version_number: result.version_number,
+            download_url: result.download_url,
+            annotations: result.annotations,
+          };
+          docsEdited.push(payload);
+          write(
+            `data: ${JSON.stringify({
+              type: "doc_edited",
+              ...payload,
+            })}\n\n`,
+          );
+          toolResults.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: JSON.stringify({
+              ok: true,
+              doc_id: docId,
+              document_id: indexed.document_id,
+              version_id: result.version_id,
+              version_number: result.version_number,
+              applied: result.annotations.length,
+              errors: result.errors,
+            }),
+          });
+        } else {
+          write(
+            `data: ${JSON.stringify({
+              type: "doc_edited",
+              filename: docInfo.filename,
+              document_id: indexed.document_id,
+              version_id: "",
+              download_url: "",
+              annotations: [],
+              error: result.error,
+            })}\n\n`,
+          );
+          toolResults.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: JSON.stringify({
+              ok: false,
+              error: result.error,
+            }),
+          });
+        }
+      }
+    } else if (tc.function.name === "replicate_document" && docIndex) {
+      const rawDocId = args.doc_id as string;
+      const requestedFilename =
+        typeof args.new_filename === "string" && args.new_filename.trim()
+          ? args.new_filename.trim()
+          : null;
+      const requestedCount =
+        typeof args.count === "number" && Number.isFinite(args.count)
+          ? Math.max(1, Math.min(20, Math.floor(args.count)))
+          : 1;
+      const sourceLabel = resolveDocLabel(rawDocId, docStore, docIndex) ?? rawDocId;
+      const sourceInfo = docStore.get(sourceLabel);
+      const sourceIndexed = docIndex[sourceLabel];
+      const sourceFilename = sourceInfo?.filename ?? rawDocId;
+
+      write(
+        `data: ${JSON.stringify({
+          type: "doc_replicate_start",
+          filename: sourceFilename,
+          count: requestedCount,
+        })}\n\n`,
+      );
+
+      const fail = (error: string) => {
+        write(
+          `data: ${JSON.stringify({
+            type: "doc_replicated",
+            filename: sourceFilename,
+            count: requestedCount,
+            copies: [],
+            error,
+          })}\n\n`,
+        );
+        toolResults.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: JSON.stringify({ ok: false, error }),
+        });
+      };
+
+      if (!sourceInfo || !sourceIndexed) {
+        fail(`Document '${rawDocId}' not found in this project.`);
+      } else if (!projectId) {
+        fail("replicate_document is only available in project chats.");
+      } else {
+        try {
+          // Pull the active version once — every copy gets the
+          // same starting bytes (with any accepted tracked
+          // changes rolled in), no point re-fetching per copy.
+          const active = await loadActiveVersion(sourceIndexed.document_id);
+          const sourcePath = active?.storage_path ?? sourceInfo.storage_path;
+          const sourcePdfPath = active?.pdf_storage_path ?? null;
+          const raw = await downloadFile(sourcePath);
+          const pdfBytes = sourcePdfPath ? await downloadFile(sourcePdfPath) : null;
+          if (!raw) {
+            fail("Could not read the source document's bytes from storage.");
+          } else {
+            // Build N filenames. With count=1 keep the
+            // pre-existing "(copy)" suffix; with count>1 use
+            // numbered "(1)", "(2)" suffixes.
+            const srcExt = sourceInfo.filename.match(/\.[^./\\]+$/)?.[0] ?? "";
+            const baseStem = (() => {
+              if (requestedFilename) {
+                return requestedFilename.replace(/\.[^./\\]+$/, "");
+              }
+              return sourceInfo.filename.replace(/\.[^./\\]+$/, "");
+            })();
+            const filenames: string[] = [];
+            for (let n = 1; n <= requestedCount; n++) {
+              const suffix =
+                requestedCount === 1 ? (requestedFilename ? "" : " (copy)") : ` (${n})`;
+              filenames.push(`${baseStem}${suffix}${srcExt}`);
+            }
+
+            // Insert N documents — Prisma createMany doesn't return rows,
+            // so we insert one by one to get IDs.
+            const newDocs: { id: string; filename: string }[] = [];
+            for (const fn of filenames) {
+              const d = await prisma.document.create({
+                data: {
+                  projectId: projectId ?? undefined,
+                  userId,
+                  filename: fn,
+                  fileType: sourceInfo.file_type,
+                  sizeBytes: raw.byteLength,
+                  status: "ready",
+                },
+                select: { id: true, filename: true },
+              });
+              newDocs.push(d);
+            }
+            if (newDocs.length === 0) {
+              fail("Failed to record replicated documents");
+            } else {
+              const contentType =
+                sourceInfo.file_type === "pdf"
+                  ? "application/pdf"
+                  : "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+
+              // Parallel uploads: the doc bytes (and PDF
+              // rendition if any) for every new copy.
+              const uploadJobs: Promise<unknown>[] = [];
+              const newKeys: string[] = [];
+              const newPdfKeys: (string | null)[] = [];
+              for (const d of newDocs) {
+                const key = storageKey(userId, d.id, d.filename);
+                newKeys.push(key);
+                uploadJobs.push(uploadFile(key, raw, contentType));
+                if (pdfBytes) {
+                  const pdfKey = convertedPdfKey(userId, d.id);
+                  newPdfKeys.push(pdfKey);
+                  uploadJobs.push(uploadFile(pdfKey, pdfBytes, "application/pdf"));
+                } else {
+                  newPdfKeys.push(null);
+                }
+              }
+              await Promise.all(uploadJobs);
+
+              // Insert N versions — need IDs back.
+              const versionByDocId = new Map<string, string>();
+              for (let idx = 0; idx < newDocs.length; idx++) {
+                const d = newDocs[idx];
+                const v = await prisma.documentVersion.create({
+                  data: {
+                    documentId: d.id,
+                    storagePath: newKeys[idx],
+                    pdfStoragePath: newPdfKeys[idx],
+                    source: "upload",
+                    versionNumber: 1,
+                    displayName: d.filename,
+                  },
+                  select: { id: true, documentId: true },
+                });
+                versionByDocId.set(v.documentId, v.id);
+              }
+
+              if (versionByDocId.size !== newDocs.length) {
+                fail("Failed to record replicated document versions");
+              } else {
+                // Update current_version_id for each doc
+                await Promise.all(
+                  newDocs.map((d) =>
+                    prisma.document.update({
+                      where: { id: d.id },
+                      data: {
+                        currentVersionId: versionByDocId.get(d.id),
+                      },
+                    }),
+                  ),
+                );
+
+                // Register every copy under a fresh doc-N
+                // slug so the model can edit/read any of
+                // them in the same turn.
+                const existingLabels = new Set(Object.keys(docIndex));
+                let nextLabelIdx = 0;
+                const copies: {
+                  new_filename: string;
+                  document_id: string;
+                  version_id: string;
+                }[] = [];
+                const toolPayloadCopies: {
+                  doc_id: string;
+                  document_id: string;
+                  version_id: string;
+                  filename: string;
+                  download_url: string;
+                }[] = [];
+                for (let idx = 0; idx < newDocs.length; idx++) {
+                  const d = newDocs[idx];
+                  const newKey = newKeys[idx];
+                  const versionId = versionByDocId.get(d.id);
+                  if (!versionId) continue;
+                  while (existingLabels.has(`doc-${nextLabelIdx}`)) nextLabelIdx++;
+                  const slug = `doc-${nextLabelIdx}`;
+                  existingLabels.add(slug);
+                  docIndex[slug] = {
+                    document_id: d.id,
+                    filename: d.filename,
+                  };
+                  docStore.set(slug, {
+                    storage_path: newKey,
+                    file_type: sourceInfo.file_type,
+                    filename: d.filename,
+                  });
+                  copies.push({
+                    new_filename: d.filename,
+                    document_id: d.id,
+                    version_id: versionId,
+                  });
+                  toolPayloadCopies.push({
+                    doc_id: slug,
+                    document_id: d.id,
+                    version_id: versionId,
+                    filename: d.filename,
+                    download_url: buildDownloadUrl(newKey, d.filename),
+                  });
+                }
+
+                write(
+                  `data: ${JSON.stringify({
+                    type: "doc_replicated",
+                    filename: sourceFilename,
+                    count: copies.length,
+                    copies,
+                  })}\n\n`,
+                );
+                docsReplicated.push({
+                  filename: sourceFilename,
+                  count: copies.length,
+                  copies,
+                });
+                toolResults.push({
+                  role: "tool",
+                  tool_call_id: tc.id,
+                  content: JSON.stringify({
+                    ok: true,
+                    count: copies.length,
+                    copies: toolPayloadCopies,
+                  }),
+                });
+              }
+            }
+          }
+        } catch (e) {
+          fail(`replicate_document failed: ${String(e)}`);
+        }
+      }
+    } else if (tc.function.name === "generate_docx") {
+      const title = args.title as string;
+      const landscape = !!args.landscape;
+      logger.info(
+        `[generate_docx] title="${title}" landscape=${landscape} args.landscape=${args.landscape}`,
+      );
+      const previewFilename = `${
+        title
+          .replace(/[^a-zA-Z0-9 _-]/g, "")
+          .trim()
+          .slice(0, 64) || "document"
+      }.docx`;
+      write(
+        `data: ${JSON.stringify({ type: "doc_created_start", filename: previewFilename })}\n\n`,
+      );
+      const result = await generateDocx(title, args.sections as unknown[], userId, {
+        landscape,
+        projectId: projectId ?? null,
+      });
+      let newDocLabel: string | null = null;
+      if ("filename" in result && "download_url" in result) {
+        const dlFilename = result.filename as string;
+        const dlUrl = result.download_url as string;
+        const documentId = (result as { document_id?: string }).document_id;
+        const versionId = (result as { version_id?: string }).version_id;
+        const versionNumber = (result as { version_number?: number }).version_number ?? null;
+        const storagePath = (result as { storage_path?: string }).storage_path;
+
+        // Register the generated doc in the chat context so
+        // edit_document (and read_document / find_in_document)
+        // can act on it within the same assistant turn. New label
+        // is the next free `doc-N` index. Subsequent turns pick
+        // it up via the normal attachment/project doc query.
+        if (documentId && storagePath && docIndex) {
+          const existingLabels = new Set(Object.keys(docIndex));
+          let i = 0;
+          while (existingLabels.has(`doc-${i}`)) i++;
+          newDocLabel = `doc-${i}`;
+          docIndex[newDocLabel] = {
+            document_id: documentId,
+            filename: dlFilename,
+          };
+          docStore.set(newDocLabel, {
+            storage_path: storagePath,
+            file_type: "docx",
+            filename: dlFilename,
+          });
+        }
+
+        write(
+          `data: ${JSON.stringify({
+            type: "doc_created",
+            filename: dlFilename,
+            download_url: dlUrl,
+            document_id: documentId,
+            version_id: versionId,
+            version_number: versionNumber,
+          })}\n\n`,
+        );
+        docsCreated.push({
+          filename: dlFilename,
+          download_url: dlUrl,
+          document_id: documentId,
+          version_id: versionId,
+          version_number: versionNumber,
+        });
+      } else {
+        write(
+          `data: ${JSON.stringify({ type: "doc_created", filename: previewFilename, download_url: "" })}\n\n`,
+        );
+      }
+      // Surface the chat-local doc label in the tool result so the
+      // model can pass it as `doc_id` to edit_document / read_document
+      // / find_in_document in the same turn. Without this the model
+      // only sees the DB UUID, which isn't valid as a doc_id anchor.
+      const { download_url, storage_path, ...safeToolResult } = result as Record<string, unknown>;
+      const toolResultPayload = newDocLabel
+        ? {
+            ...safeToolResult,
+            doc_id: newDocLabel,
+            next_required_action: `Before writing your final response, call read_document with doc_id "${newDocLabel}". Describe and cite the generated document using doc_id "${newDocLabel}", not the source/template document.`,
+          }
+        : safeToolResult;
+      toolResults.push({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: JSON.stringify(toolResultPayload),
+      });
+    }
+  }
+
+  return {
+    toolResults,
+    docsRead,
+    docsFound,
+    docsCreated,
+    docsReplicated,
+    workflowsApplied,
+    docsEdited,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -2571,17 +2346,15 @@ const CITATIONS_BLOCK_RE = /<CITATIONS>\s*([\s\S]*?)\s*<\/CITATIONS>/;
 const CITATIONS_OPEN_TAG = "<CITATIONS>";
 
 function parseCitations(text: string): ParsedCitation[] {
-    const match = text.match(CITATIONS_BLOCK_RE);
-    if (!match) return [];
-    try {
-        const raw = JSON.parse(match[1]);
-        if (!Array.isArray(raw)) return [];
-        return raw
-            .map(normalizeCitation)
-            .filter((c): c is ParsedCitation => c !== null);
-    } catch {
-        return [];
-    }
+  const match = text.match(CITATIONS_BLOCK_RE);
+  if (!match) return [];
+  try {
+    const raw = JSON.parse(match[1]);
+    if (!Array.isArray(raw)) return [];
+    return raw.map(normalizeCitation).filter((c): c is ParsedCitation => c !== null);
+  } catch {
+    return [];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2589,354 +2362,343 @@ function parseCitations(text: string): ParsedCitation[] {
 // ---------------------------------------------------------------------------
 
 export type EditAnnotation = {
-    kind: "edit";
-    edit_id: string;
-    document_id: string;
-    version_id: string;
-    version_number?: number | null;
-    change_id: string;
-    del_w_id?: string;
-    ins_w_id?: string;
-    deleted_text: string;
-    inserted_text: string;
-    context_before: string;
-    context_after: string;
-    reason?: string;
-    status: "pending" | "accepted" | "rejected";
+  kind: "edit";
+  edit_id: string;
+  document_id: string;
+  version_id: string;
+  version_number?: number | null;
+  change_id: string;
+  del_w_id?: string;
+  ins_w_id?: string;
+  deleted_text: string;
+  inserted_text: string;
+  context_before: string;
+  context_after: string;
+  reason?: string;
+  status: "pending" | "accepted" | "rejected";
 };
 
 type AssistantEvent =
-    | { type: "reasoning"; text: string }
-    | { type: "doc_read"; filename: string; document_id?: string }
-    | {
-          type: "doc_find";
-          filename: string;
-          query: string;
-          total_matches: number;
-      }
-    | {
-          type: "doc_created";
-          filename: string;
-          download_url: string;
-          document_id?: string;
-          version_id?: string;
-          version_number?: number | null;
-      }
-    | { type: "doc_download"; filename: string; download_url: string }
-    | {
-          type: "doc_replicated";
-          /** Source document being copied. */
-          filename: string;
-          count: number;
-          copies: {
-              new_filename: string;
-              document_id: string;
-              version_id: string;
-          }[];
-      }
-    | { type: "workflow_applied"; workflow_id: string; title: string }
-    | {
-          type: "doc_edited";
-          filename: string;
-          document_id: string;
-          version_id: string;
-          /** Per-document monotonic Vn; null if backend couldn't determine it. */
-          version_number: number | null;
-          download_url: string;
-          annotations: EditAnnotation[];
-      }
-    | { type: "content"; text: string };
+  | { type: "reasoning"; text: string }
+  | { type: "doc_read"; filename: string; document_id?: string }
+  | {
+      type: "doc_find";
+      filename: string;
+      query: string;
+      total_matches: number;
+    }
+  | {
+      type: "doc_created";
+      filename: string;
+      download_url: string;
+      document_id?: string;
+      version_id?: string;
+      version_number?: number | null;
+    }
+  | { type: "doc_download"; filename: string; download_url: string }
+  | {
+      type: "doc_replicated";
+      /** Source document being copied. */
+      filename: string;
+      count: number;
+      copies: {
+        new_filename: string;
+        document_id: string;
+        version_id: string;
+      }[];
+    }
+  | { type: "workflow_applied"; workflow_id: string; title: string }
+  | {
+      type: "doc_edited";
+      filename: string;
+      document_id: string;
+      version_id: string;
+      /** Per-document monotonic Vn; null if backend couldn't determine it. */
+      version_number: number | null;
+      download_url: string;
+      annotations: EditAnnotation[];
+    }
+  | { type: "content"; text: string };
 
 export async function runLLMStream(params: {
-    apiMessages: unknown[];
-    docStore: DocStore;
-    docIndex: DocIndex;
-    userId: string;
-    write: (s: string) => void;
-    extraTools?: unknown[];
-    workflowStore?: WorkflowStore;
-    tabularStore?: TabularCellStore;
-    buildCitations?: (fullText: string) => unknown[];
-    model?: string;
-    apiKeys?: import("./llm").UserApiKeys;
-    /**
-     * If set, generate_docx will attach created docs to this project so
-     * they appear in the project sidebar. Leave null for general chats —
-     * generated docs still get persisted, but as standalone documents.
-     */
-    projectId?: string | null;
+  apiMessages: unknown[];
+  docStore: DocStore;
+  docIndex: DocIndex;
+  userId: string;
+  write: (s: string) => void;
+  extraTools?: unknown[];
+  workflowStore?: WorkflowStore;
+  tabularStore?: TabularCellStore;
+  buildCitations?: (fullText: string) => unknown[];
+  model?: string;
+  apiKeys?: import("./llm").UserApiKeys;
+  /**
+   * If set, generate_docx will attach created docs to this project so
+   * they appear in the project sidebar. Leave null for general chats —
+   * generated docs still get persisted, but as standalone documents.
+   */
+  projectId?: string | null;
 }): Promise<{ fullText: string; events: AssistantEvent[] }> {
-    const {
-        apiMessages,
+  const {
+    apiMessages,
+    docStore,
+    docIndex,
+    userId,
+    write,
+    extraTools,
+    workflowStore,
+    tabularStore,
+    buildCitations,
+    model,
+    apiKeys,
+    projectId,
+  } = params;
+  const activeTools = extraTools?.length
+    ? [...TOOLS, ...WORKFLOW_TOOLS, ...extraTools]
+    : [...TOOLS, ...WORKFLOW_TOOLS];
+
+  // Extract system prompt; pass remaining turns to the adapter as
+  // plain user/assistant messages.
+  const rawMsgs = apiMessages as { role: string; content: string | null }[];
+  const systemPrompt = rawMsgs[0]?.role === "system" ? (rawMsgs[0].content ?? "") : "";
+  const chatMessages: LlmMessage[] = rawMsgs
+    .filter((m) => m.role !== "system")
+    .map((m) => ({
+      role: m.role === "assistant" ? "assistant" : "user",
+      content: m.content ?? "",
+    }));
+
+  const events: AssistantEvent[] = [];
+  // One assistant turn produces at most one document_versions row per
+  // edited doc. `runToolCalls` fires once per tool-call batch; the model
+  // may emit multiple batches in a single turn, so this map persists
+  // across batches to let subsequent edit_document calls overwrite the
+  // turn's existing version instead of creating a new one.
+  const turnEditState: TurnEditState = new Map();
+  let fullText = "";
+  let iterText = "";
+  let iterVisibleText = "";
+  let iterReasoning = "";
+  let visibleTailBuffer = "";
+  let citationsOpenSeen = false;
+
+  const streamVisibleContent = (delta: string) => {
+    if (!delta) return;
+    if (citationsOpenSeen) return;
+
+    const combined = visibleTailBuffer + delta;
+    const markerIdx = combined.indexOf(CITATIONS_OPEN_TAG);
+    if (markerIdx >= 0) {
+      const visible = combined.slice(0, markerIdx);
+      if (visible) {
+        iterVisibleText += visible;
+        write(`data: ${JSON.stringify({ type: "content_delta", text: visible })}\n\n`);
+      }
+      visibleTailBuffer = "";
+      citationsOpenSeen = true;
+      return;
+    }
+
+    const keep = Math.min(CITATIONS_OPEN_TAG.length - 1, combined.length);
+    const visible = combined.slice(0, combined.length - keep);
+    visibleTailBuffer = combined.slice(combined.length - keep);
+    if (visible) {
+      iterVisibleText += visible;
+      write(`data: ${JSON.stringify({ type: "content_delta", text: visible })}\n\n`);
+    }
+  };
+
+  const flushVisibleTail = () => {
+    if (citationsOpenSeen || !visibleTailBuffer) {
+      visibleTailBuffer = "";
+      return;
+    }
+    iterVisibleText += visibleTailBuffer;
+    write(`data: ${JSON.stringify({ type: "content_delta", text: visibleTailBuffer })}\n\n`);
+    visibleTailBuffer = "";
+  };
+
+  const flushText = () => {
+    if (!iterText) return;
+    fullText += iterText;
+    flushVisibleTail();
+    if (iterVisibleText) {
+      events.push({ type: "content", text: iterVisibleText });
+    }
+    iterText = "";
+    iterVisibleText = "";
+    visibleTailBuffer = "";
+    citationsOpenSeen = false;
+  };
+
+  const selectedModel = resolveModel(model, DEFAULT_MAIN_MODEL);
+
+  await streamChatWithTools({
+    model: selectedModel,
+    systemPrompt,
+    messages: chatMessages,
+    tools: activeTools as OpenAIToolSchema[],
+    maxIterations: 10,
+    apiKeys,
+    enableThinking: true,
+    callbacks: {
+      onContentDelta: (delta) => {
+        iterText += delta;
+        streamVisibleContent(delta);
+      },
+      onReasoningDelta: (delta) => {
+        iterReasoning += delta;
+        write(`data: ${JSON.stringify({ type: "reasoning_delta", text: delta })}\n\n`);
+      },
+      onReasoningBlockEnd: () => {
+        if (!iterReasoning) return;
+        events.push({ type: "reasoning", text: iterReasoning });
+        write(`data: ${JSON.stringify({ type: "reasoning_block_end" })}\n\n`);
+        iterReasoning = "";
+      },
+      // Fires after Claude's turn ends with stop_reason=tool_use, before
+      // the tool actually runs. Flushes any buffered assistant text so
+      // it's emitted in chronological order, then signals the client so
+      // it can open a fresh PreResponseWrapper (shows "Working…") while
+      // the tool executes — avoids the dead gap between message_stop
+      // and the first tool-specific event.
+      onToolCallStart: (call) => {
+        flushText();
+        write(
+          `data: ${JSON.stringify({
+            type: "tool_call_start",
+            name: call.name,
+          })}\n\n`,
+        );
+      },
+    },
+    runTools: async (calls) => {
+      // Emit any text the model produced before this tool turn so the
+      // UI sees it before the tool results stream in.
+      flushText();
+
+      const toolCalls: ToolCall[] = calls.map((c) => ({
+        id: c.id,
+        function: {
+          name: c.name,
+          arguments: JSON.stringify(c.input),
+        },
+      }));
+      const {
+        toolResults,
+        docsRead,
+        docsFound,
+        docsCreated,
+        docsReplicated,
+        workflowsApplied,
+        docsEdited,
+      } = await runToolCalls(
+        toolCalls,
         docStore,
-        docIndex,
         userId,
         write,
-        extraTools,
         workflowStore,
         tabularStore,
-        buildCitations,
-        model,
-        apiKeys,
+        docIndex,
+        turnEditState,
         projectId,
-    } = params;
-    const activeTools = extraTools?.length
-        ? [...TOOLS, ...WORKFLOW_TOOLS, ...extraTools]
-        : [...TOOLS, ...WORKFLOW_TOOLS];
+      );
+      for (const r of docsRead) {
+        events.push({
+          type: "doc_read",
+          filename: r.filename,
+          document_id: r.document_id,
+        });
+      }
+      for (const f of docsFound) {
+        events.push({
+          type: "doc_find",
+          filename: f.filename,
+          query: f.query,
+          total_matches: f.total_matches,
+        });
+      }
+      for (const dl of docsCreated) {
+        events.push({
+          type: "doc_created",
+          filename: dl.filename,
+          download_url: dl.download_url,
+          document_id: dl.document_id,
+          version_id: dl.version_id,
+          version_number: dl.version_number ?? null,
+        });
+      }
+      for (const r of docsReplicated) {
+        events.push({
+          type: "doc_replicated",
+          filename: r.filename,
+          count: r.count,
+          copies: r.copies,
+        });
+      }
+      for (const wf of workflowsApplied) {
+        events.push({
+          type: "workflow_applied",
+          workflow_id: wf.workflow_id,
+          title: wf.title,
+        });
+      }
+      for (const e of docsEdited) {
+        events.push({
+          type: "doc_edited",
+          filename: e.filename,
+          document_id: e.document_id,
+          version_id: e.version_id,
+          version_number: e.version_number,
+          download_url: e.download_url,
+          annotations: e.annotations,
+        });
+      }
 
-    // Extract system prompt; pass remaining turns to the adapter as
-    // plain user/assistant messages.
-    const rawMsgs = apiMessages as { role: string; content: string | null }[];
-    const systemPrompt =
-        rawMsgs[0]?.role === "system" ? (rawMsgs[0].content ?? "") : "";
-    const chatMessages: LlmMessage[] = rawMsgs
-        .filter((m) => m.role !== "system")
-        .map((m) => ({
-            role: m.role === "assistant" ? "assistant" : "user",
-            content: m.content ?? "",
-        }));
+      // Index alignment would break if any tool branch skips its
+      // push (unhandled tool name, disabled store, guard failure).
+      // Each tool_result already carries its tool_call_id, so key off
+      // that directly — and fall back to an error result for any
+      // tool_use that didn't produce one, so Claude's next request
+      // has a tool_result for every tool_use it sent.
+      const resultByCallId = new Map<string, string>();
+      for (const r of toolResults) {
+        const row = r as { tool_call_id: string; content?: unknown };
+        resultByCallId.set(row.tool_call_id, String(row.content ?? ""));
+      }
+      return toolCalls.map((c) => ({
+        tool_use_id: c.id,
+        content:
+          resultByCallId.get(c.id) ??
+          JSON.stringify({
+            error: `Tool '${c.function.name}' is not available.`,
+          }),
+      }));
+    },
+  });
 
-    const events: AssistantEvent[] = [];
-    // One assistant turn produces at most one document_versions row per
-    // edited doc. `runToolCalls` fires once per tool-call batch; the model
-    // may emit multiple batches in a single turn, so this map persists
-    // across batches to let subsequent edit_document calls overwrite the
-    // turn's existing version instead of creating a new one.
-    const turnEditState: TurnEditState = new Map();
-    let fullText = "";
-    let iterText = "";
-    let iterVisibleText = "";
-    let iterReasoning = "";
-    let visibleTailBuffer = "";
-    let citationsOpenSeen = false;
+  flushText();
 
-    const streamVisibleContent = (delta: string) => {
-        if (!delta) return;
-        if (citationsOpenSeen) return;
+  // Parse and emit citations from <CITATIONS> block
+  const citations = buildCitations
+    ? buildCitations(fullText)
+    : parseCitations(fullText).map((c) => {
+        const docInfo = resolveDoc(c.doc_id, docIndex);
+        return {
+          ref: c.ref,
+          doc_id: c.doc_id,
+          document_id: docInfo?.document_id,
+          version_id: docInfo?.version_id ?? null,
+          version_number: docInfo?.version_number ?? null,
+          filename: docInfo?.filename ?? c.doc_id,
+          page: c.page,
+          quote: c.quote,
+        };
+      });
+  write(`data: ${JSON.stringify({ type: "citations", citations })}\n\n`);
+  write("data: [DONE]\n\n");
 
-        const combined = visibleTailBuffer + delta;
-        const markerIdx = combined.indexOf(CITATIONS_OPEN_TAG);
-        if (markerIdx >= 0) {
-            const visible = combined.slice(0, markerIdx);
-            if (visible) {
-                iterVisibleText += visible;
-                write(
-                    `data: ${JSON.stringify({ type: "content_delta", text: visible })}\n\n`,
-                );
-            }
-            visibleTailBuffer = "";
-            citationsOpenSeen = true;
-            return;
-        }
-
-        const keep = Math.min(CITATIONS_OPEN_TAG.length - 1, combined.length);
-        const visible = combined.slice(0, combined.length - keep);
-        visibleTailBuffer = combined.slice(combined.length - keep);
-        if (visible) {
-            iterVisibleText += visible;
-            write(
-                `data: ${JSON.stringify({ type: "content_delta", text: visible })}\n\n`,
-            );
-        }
-    };
-
-    const flushVisibleTail = () => {
-        if (citationsOpenSeen || !visibleTailBuffer) {
-            visibleTailBuffer = "";
-            return;
-        }
-        iterVisibleText += visibleTailBuffer;
-        write(
-            `data: ${JSON.stringify({ type: "content_delta", text: visibleTailBuffer })}\n\n`,
-        );
-        visibleTailBuffer = "";
-    };
-
-    const flushText = () => {
-        if (!iterText) return;
-        fullText += iterText;
-        flushVisibleTail();
-        if (iterVisibleText) {
-            events.push({ type: "content", text: iterVisibleText });
-        }
-        iterText = "";
-        iterVisibleText = "";
-        visibleTailBuffer = "";
-        citationsOpenSeen = false;
-    };
-
-    const selectedModel = resolveModel(model, DEFAULT_MAIN_MODEL);
-
-    await streamChatWithTools({
-        model: selectedModel,
-        systemPrompt,
-        messages: chatMessages,
-        tools: activeTools as OpenAIToolSchema[],
-        maxIterations: 10,
-        apiKeys,
-        enableThinking: true,
-        callbacks: {
-            onContentDelta: (delta) => {
-                iterText += delta;
-                streamVisibleContent(delta);
-            },
-            onReasoningDelta: (delta) => {
-                iterReasoning += delta;
-                write(
-                    `data: ${JSON.stringify({ type: "reasoning_delta", text: delta })}\n\n`,
-                );
-            },
-            onReasoningBlockEnd: () => {
-                if (!iterReasoning) return;
-                events.push({ type: "reasoning", text: iterReasoning });
-                write(
-                    `data: ${JSON.stringify({ type: "reasoning_block_end" })}\n\n`,
-                );
-                iterReasoning = "";
-            },
-            // Fires after Claude's turn ends with stop_reason=tool_use, before
-            // the tool actually runs. Flushes any buffered assistant text so
-            // it's emitted in chronological order, then signals the client so
-            // it can open a fresh PreResponseWrapper (shows "Working…") while
-            // the tool executes — avoids the dead gap between message_stop
-            // and the first tool-specific event.
-            onToolCallStart: (call) => {
-                flushText();
-                write(
-                    `data: ${JSON.stringify({
-                        type: "tool_call_start",
-                        name: call.name,
-                    })}\n\n`,
-                );
-            },
-        },
-        runTools: async (calls) => {
-            // Emit any text the model produced before this tool turn so the
-            // UI sees it before the tool results stream in.
-            flushText();
-
-            const toolCalls: ToolCall[] = calls.map((c) => ({
-                id: c.id,
-                function: {
-                    name: c.name,
-                    arguments: JSON.stringify(c.input),
-                },
-            }));
-            const {
-                toolResults,
-                docsRead,
-                docsFound,
-                docsCreated,
-                docsReplicated,
-                workflowsApplied,
-                docsEdited,
-            } = await runToolCalls(
-                toolCalls,
-                docStore,
-                userId,
-                write,
-                workflowStore,
-                tabularStore,
-                docIndex,
-                turnEditState,
-                projectId,
-            );
-            for (const r of docsRead) {
-                events.push({
-                    type: "doc_read",
-                    filename: r.filename,
-                    document_id: r.document_id,
-                });
-            }
-            for (const f of docsFound) {
-                events.push({
-                    type: "doc_find",
-                    filename: f.filename,
-                    query: f.query,
-                    total_matches: f.total_matches,
-                });
-            }
-            for (const dl of docsCreated) {
-                events.push({
-                    type: "doc_created",
-                    filename: dl.filename,
-                    download_url: dl.download_url,
-                    document_id: dl.document_id,
-                    version_id: dl.version_id,
-                    version_number: dl.version_number ?? null,
-                });
-            }
-            for (const r of docsReplicated) {
-                events.push({
-                    type: "doc_replicated",
-                    filename: r.filename,
-                    count: r.count,
-                    copies: r.copies,
-                });
-            }
-            for (const wf of workflowsApplied) {
-                events.push({
-                    type: "workflow_applied",
-                    workflow_id: wf.workflow_id,
-                    title: wf.title,
-                });
-            }
-            for (const e of docsEdited) {
-                events.push({
-                    type: "doc_edited",
-                    filename: e.filename,
-                    document_id: e.document_id,
-                    version_id: e.version_id,
-                    version_number: e.version_number,
-                    download_url: e.download_url,
-                    annotations: e.annotations,
-                });
-            }
-
-            // Index alignment would break if any tool branch skips its
-            // push (unhandled tool name, disabled store, guard failure).
-            // Each tool_result already carries its tool_call_id, so key off
-            // that directly — and fall back to an error result for any
-            // tool_use that didn't produce one, so Claude's next request
-            // has a tool_result for every tool_use it sent.
-            const resultByCallId = new Map<string, string>();
-            for (const r of toolResults) {
-                const row = r as { tool_call_id: string; content?: unknown };
-                resultByCallId.set(row.tool_call_id, String(row.content ?? ""));
-            }
-            return toolCalls.map((c) => ({
-                tool_use_id: c.id,
-                content:
-                    resultByCallId.get(c.id) ??
-                    JSON.stringify({
-                        error: `Tool '${c.function.name}' is not available.`,
-                    }),
-            }));
-        },
-    });
-
-    flushText();
-
-    // Parse and emit citations from <CITATIONS> block
-    const citations = buildCitations
-        ? buildCitations(fullText)
-        : parseCitations(fullText).map((c) => {
-              const docInfo = resolveDoc(c.doc_id, docIndex);
-              return {
-                  ref: c.ref,
-                  doc_id: c.doc_id,
-                  document_id: docInfo?.document_id,
-                  version_id: docInfo?.version_id ?? null,
-                  version_number: docInfo?.version_number ?? null,
-                  filename: docInfo?.filename ?? c.doc_id,
-                  page: c.page,
-                  quote: c.quote,
-              };
-          });
-    write(`data: ${JSON.stringify({ type: "citations", citations })}\n\n`);
-    write("data: [DONE]\n\n");
-
-    return { fullText, events };
+  return { fullText, events };
 }
 
 // ---------------------------------------------------------------------------
@@ -2944,36 +2706,35 @@ export async function runLLMStream(params: {
 // ---------------------------------------------------------------------------
 
 export function extractAnnotations(
-    fullText: string,
-    docIndex: DocIndex,
-    events?: ({ type: string } & Record<string, unknown>[]) | unknown[],
+  fullText: string,
+  docIndex: DocIndex,
+  events?: ({ type: string } & Record<string, unknown>[]) | unknown[],
 ): unknown[] {
-    const out: unknown[] = parseCitations(fullText).map((c) => {
-        const docInfo = resolveDoc(c.doc_id, docIndex);
-        return {
-            type: "citation_data",
-            ref: c.ref,
-            doc_id: c.doc_id,
-            document_id: docInfo?.document_id,
-            version_id: docInfo?.version_id ?? null,
-            version_number: docInfo?.version_number ?? null,
-            filename: docInfo?.filename ?? c.doc_id,
-            page: c.page,
-            quote: c.quote,
-        };
-    });
-    if (Array.isArray(events)) {
-        for (const ev of events as {
-            type?: string;
-            annotations?: EditAnnotation[];
-        }[]) {
-            if (ev?.type === "doc_edited" && Array.isArray(ev.annotations)) {
-                for (const a of ev.annotations)
-                    out.push({ ...a, type: "edit_data" });
-            }
-        }
+  const out: unknown[] = parseCitations(fullText).map((c) => {
+    const docInfo = resolveDoc(c.doc_id, docIndex);
+    return {
+      type: "citation_data",
+      ref: c.ref,
+      doc_id: c.doc_id,
+      document_id: docInfo?.document_id,
+      version_id: docInfo?.version_id ?? null,
+      version_number: docInfo?.version_number ?? null,
+      filename: docInfo?.filename ?? c.doc_id,
+      page: c.page,
+      quote: c.quote,
+    };
+  });
+  if (Array.isArray(events)) {
+    for (const ev of events as {
+      type?: string;
+      annotations?: EditAnnotation[];
+    }[]) {
+      if (ev?.type === "doc_edited" && Array.isArray(ev.annotations)) {
+        for (const a of ev.annotations) out.push({ ...a, type: "edit_data" });
+      }
     }
-    return out;
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -2981,244 +2742,243 @@ export function extractAnnotations(
 // ---------------------------------------------------------------------------
 
 export async function buildDocContext(
-    messages: ChatMessage[],
-    userId: string,
-    chatId?: string | null,
+  messages: ChatMessage[],
+  userId: string,
+  chatId?: string | null,
 ): Promise<{ docIndex: DocIndex; docStore: DocStore }> {
-    const docIndex: DocIndex = {};
-    const docStore: DocStore = new Map();
+  const docIndex: DocIndex = {};
+  const docStore: DocStore = new Map();
 
-    const documentIds = new Set<string>();
-    for (const m of messages) {
-        for (const f of m.files ?? []) {
-            if (f.document_id) documentIds.add(f.document_id);
-        }
+  const documentIds = new Set<string>();
+  for (const m of messages) {
+    for (const f of m.files ?? []) {
+      if (f.document_id) documentIds.add(f.document_id);
     }
+  }
 
-    // Also pull in document_ids from prior assistant events in this chat —
-    // generated docs (generate_docx) and tracked-change edits (edit_document)
-    // aren't attached to user messages as files, so they only live in the
-    // assistant's `doc_created` / `doc_edited` events. Without this sweep
-    // the model loses access to generated docs after the turn that created
-    // them, and can't call edit_document / read_document on them.
-    if (chatId) {
-        const rows = await prisma.chatMessage.findMany({
-            where: { chatId, role: "assistant" },
-            select: { content: true },
-        });
-        for (const row of rows) {
-            const content = (row as { content?: unknown }).content;
-            if (!Array.isArray(content)) continue;
-            for (const ev of content as Record<string, unknown>[]) {
-                if (
-                    (ev?.type === "doc_created" || ev?.type === "doc_edited") &&
-                    typeof ev.document_id === "string"
-                ) {
-                    documentIds.add(ev.document_id);
-                }
-            }
+  // Also pull in document_ids from prior assistant events in this chat —
+  // generated docs (generate_docx) and tracked-change edits (edit_document)
+  // aren't attached to user messages as files, so they only live in the
+  // assistant's `doc_created` / `doc_edited` events. Without this sweep
+  // the model loses access to generated docs after the turn that created
+  // them, and can't call edit_document / read_document on them.
+  if (chatId) {
+    const rows = await prisma.chatMessage.findMany({
+      where: { chatId, role: "assistant" },
+      select: { content: true },
+    });
+    for (const row of rows) {
+      const content = (row as { content?: unknown }).content;
+      if (!Array.isArray(content)) continue;
+      for (const ev of content as Record<string, unknown>[]) {
+        if (
+          (ev?.type === "doc_created" || ev?.type === "doc_edited") &&
+          typeof ev.document_id === "string"
+        ) {
+          documentIds.add(ev.document_id);
         }
+      }
     }
+  }
 
-    const ids = [...documentIds];
-    if (ids.length > 0) {
-        const docs = await prisma.document.findMany({
-            where: {
-                id: { in: ids },
-                userId,
-                status: "ready",
-            },
-            select: {
-                id: true,
-                filename: true,
-                fileType: true,
-                currentVersionId: true,
-                status: true,
-            },
-        });
+  const ids = [...documentIds];
+  if (ids.length > 0) {
+    const docs = await prisma.document.findMany({
+      where: {
+        id: { in: ids },
+        userId,
+        status: "ready",
+      },
+      select: {
+        id: true,
+        filename: true,
+        fileType: true,
+        currentVersionId: true,
+        status: true,
+      },
+    });
 
-        const docList = (docs ?? []) as unknown as {
-            id: string;
-            filename: string;
-            file_type: string;
-            current_version_id?: string | null;
-            active_version_number?: number | null;
-            storage_path?: string | null;
-        }[];
-        await attachActiveVersionPaths(docList);
-        for (let i = 0; i < docList.length; i++) {
-            const doc = docList[i];
-            if (!doc.storage_path) continue;
-            const docLabel = `doc-${i}`;
-            docIndex[docLabel] = {
-                document_id: doc.id,
-                filename: doc.filename,
-                version_id: doc.current_version_id ?? null,
-                version_number: doc.active_version_number ?? null,
-            };
-            docStore.set(docLabel, {
-                storage_path: doc.storage_path,
-                file_type: doc.file_type,
-                filename: doc.filename,
-            });
-        }
+    const docList = (docs ?? []) as unknown as {
+      id: string;
+      filename: string;
+      file_type: string;
+      current_version_id?: string | null;
+      active_version_number?: number | null;
+      storage_path?: string | null;
+    }[];
+    await attachActiveVersionPaths(docList);
+    for (let i = 0; i < docList.length; i++) {
+      const doc = docList[i];
+      if (!doc.storage_path) continue;
+      const docLabel = `doc-${i}`;
+      docIndex[docLabel] = {
+        document_id: doc.id,
+        filename: doc.filename,
+        version_id: doc.current_version_id ?? null,
+        version_number: doc.active_version_number ?? null,
+      };
+      docStore.set(docLabel, {
+        storage_path: doc.storage_path,
+        file_type: doc.file_type,
+        filename: doc.filename,
+      });
     }
+  }
 
-    logger.info(
-        { docs: Object.entries(docIndex).map(([label, info]) => ({
-            label,
-            filename: info.filename,
-            document_id: info.document_id,
-        })) },
-        "[buildDocContext] available docs",
-    );
-    return { docIndex, docStore };
+  logger.info(
+    {
+      docs: Object.entries(docIndex).map(([label, info]) => ({
+        label,
+        filename: info.filename,
+        document_id: info.document_id,
+      })),
+    },
+    "[buildDocContext] available docs",
+  );
+  return { docIndex, docStore };
 }
 
 export async function buildProjectDocContext(
-    projectId: string,
-    _userId: string,
+  projectId: string,
+  _userId: string,
 ): Promise<{
-    docIndex: DocIndex;
-    docStore: DocStore;
-    folderPaths: Map<string, string>;
+  docIndex: DocIndex;
+  docStore: DocStore;
+  folderPaths: Map<string, string>;
 }> {
-    const docIndex: DocIndex = {};
-    const docStore: DocStore = new Map();
+  const docIndex: DocIndex = {};
+  const docStore: DocStore = new Map();
 
-    const [docs, folders] = await Promise.all([
-        prisma.document.findMany({
-            where: { projectId, status: "ready" },
-            select: {
-                id: true,
-                filename: true,
-                fileType: true,
-                currentVersionId: true,
-                status: true,
-                folderId: true,
-            },
-            orderBy: { createdAt: "asc" },
-        }),
-        prisma.projectSubfolder.findMany({
-            where: { projectId },
-            select: { id: true, name: true, parentFolderId: true },
-        }),
-    ]);
-    const docList = (docs ?? []) as unknown as {
-        id: string;
-        filename: string;
-        file_type: string;
-        current_version_id?: string | null;
-        active_version_number?: number | null;
-        folder_id?: string | null;
-        storage_path?: string | null;
-    }[];
-    await attachActiveVersionPaths(docList);
+  const [docs, folders] = await Promise.all([
+    prisma.document.findMany({
+      where: { projectId, status: "ready" },
+      select: {
+        id: true,
+        filename: true,
+        fileType: true,
+        currentVersionId: true,
+        status: true,
+        folderId: true,
+      },
+      orderBy: { createdAt: "asc" },
+    }),
+    prisma.projectSubfolder.findMany({
+      where: { projectId },
+      select: { id: true, name: true, parentFolderId: true },
+    }),
+  ]);
+  const docList = (docs ?? []) as unknown as {
+    id: string;
+    filename: string;
+    file_type: string;
+    current_version_id?: string | null;
+    active_version_number?: number | null;
+    folder_id?: string | null;
+    storage_path?: string | null;
+  }[];
+  await attachActiveVersionPaths(docList);
 
-    // Build folder id → full path map
-    const folderMap = new Map<
-        string,
-        { name: string; parent_folder_id: string | null }
-    >();
-    for (const f of folders ?? [])
-        folderMap.set(f.id, {
-            name: f.name,
-            parent_folder_id: f.parentFolderId,
-        });
+  // Build folder id → full path map
+  const folderMap = new Map<string, { name: string; parent_folder_id: string | null }>();
+  for (const f of folders ?? [])
+    folderMap.set(f.id, {
+      name: f.name,
+      parent_folder_id: f.parentFolderId,
+    });
 
-    function resolvePath(folderId: string | null): string {
-        if (!folderId) return "";
-        const parts: string[] = [];
-        let cur: string | null = folderId;
-        while (cur) {
-            const f = folderMap.get(cur);
-            if (!f) break;
-            parts.unshift(f.name);
-            cur = f.parent_folder_id;
-        }
-        return parts.join(" / ");
+  function resolvePath(folderId: string | null): string {
+    if (!folderId) return "";
+    const parts: string[] = [];
+    let cur: string | null = folderId;
+    while (cur) {
+      const f = folderMap.get(cur);
+      if (!f) break;
+      parts.unshift(f.name);
+      cur = f.parent_folder_id;
     }
+    return parts.join(" / ");
+  }
 
-    const folderPaths = new Map<string, string>(); // doc label → folder path
+  const folderPaths = new Map<string, string>(); // doc label → folder path
 
-    for (let i = 0; i < docList.length; i++) {
-        const doc = docList[i];
-        if (!doc.storage_path) continue;
-        const docLabel = `doc-${i}`;
-        docIndex[docLabel] = {
-            document_id: doc.id,
-            filename: doc.filename,
-            version_id: doc.current_version_id ?? null,
-            version_number: doc.active_version_number ?? null,
-        };
-        docStore.set(docLabel, {
-            storage_path: doc.storage_path,
-            file_type: doc.file_type,
-            filename: doc.filename,
-        });
-        const path = resolvePath(doc.folder_id ?? null);
-        if (path) folderPaths.set(docLabel, path);
-    }
+  for (let i = 0; i < docList.length; i++) {
+    const doc = docList[i];
+    if (!doc.storage_path) continue;
+    const docLabel = `doc-${i}`;
+    docIndex[docLabel] = {
+      document_id: doc.id,
+      filename: doc.filename,
+      version_id: doc.current_version_id ?? null,
+      version_number: doc.active_version_number ?? null,
+    };
+    docStore.set(docLabel, {
+      storage_path: doc.storage_path,
+      file_type: doc.file_type,
+      filename: doc.filename,
+    });
+    const path = resolvePath(doc.folder_id ?? null);
+    if (path) folderPaths.set(docLabel, path);
+  }
 
-    logger.info(
-        { docs: Object.entries(docIndex).map(([label, info]) => ({
-            label,
-            filename: info.filename,
-            document_id: info.document_id,
-            folder: folderPaths.get(label) ?? null,
-        })) },
-        "[buildProjectDocContext] available docs",
-    );
-    return { docIndex, docStore, folderPaths };
+  logger.info(
+    {
+      docs: Object.entries(docIndex).map(([label, info]) => ({
+        label,
+        filename: info.filename,
+        document_id: info.document_id,
+        folder: folderPaths.get(label) ?? null,
+      })),
+    },
+    "[buildProjectDocContext] available docs",
+  );
+  return { docIndex, docStore, folderPaths };
 }
 
 export async function buildWorkflowStore(
-    userId: string,
-    userEmail: string | null | undefined,
+  userId: string,
+  userEmail: string | null | undefined,
 ): Promise<WorkflowStore> {
-    const { BUILTIN_WORKFLOWS } = await import("./builtinWorkflows");
-    const store: WorkflowStore = new Map();
-    const normalizedUserEmail = (userEmail ?? "").trim().toLowerCase();
+  const { BUILTIN_WORKFLOWS } = await import("./builtinWorkflows");
+  const store: WorkflowStore = new Map();
+  const normalizedUserEmail = (userEmail ?? "").trim().toLowerCase();
 
-    // Seed built-ins first
-    for (const wf of BUILTIN_WORKFLOWS) {
-        store.set(wf.id, { title: wf.title, prompt_md: wf.prompt_md });
+  // Seed built-ins first
+  for (const wf of BUILTIN_WORKFLOWS) {
+    store.set(wf.id, { title: wf.title, prompt_md: wf.prompt_md });
+  }
+
+  // Then overlay user-owned assistant workflows.
+  const workflows = await prisma.workflow.findMany({
+    where: { userId, type: "assistant" },
+    select: { id: true, title: true, promptMd: true },
+  });
+  for (const wf of workflows) {
+    if (wf.promptMd) {
+      store.set(wf.id, { title: wf.title, prompt_md: wf.promptMd });
     }
+  }
 
-    // Then overlay user-owned assistant workflows.
-    const workflows = await prisma.workflow.findMany({
-        where: { userId, type: "assistant" },
-        select: { id: true, title: true, promptMd: true },
+  // Shared assistant workflows must also be readable by workflow tools.
+  if (normalizedUserEmail) {
+    const shares = await prisma.workflowShare.findMany({
+      where: { sharedWithEmail: normalizedUserEmail },
+      select: { workflowId: true },
     });
-    for (const wf of workflows) {
+    const sharedIds = [...new Set(shares.map((share) => share.workflowId))];
+    if (sharedIds.length > 0) {
+      const sharedWorkflows = await prisma.workflow.findMany({
+        where: { id: { in: sharedIds }, type: "assistant" },
+        select: { id: true, title: true, promptMd: true },
+      });
+      for (const wf of sharedWorkflows) {
         if (wf.promptMd) {
-            store.set(wf.id, { title: wf.title, prompt_md: wf.promptMd });
+          store.set(wf.id, {
+            title: wf.title,
+            prompt_md: wf.promptMd,
+          });
         }
+      }
     }
-
-    // Shared assistant workflows must also be readable by workflow tools.
-    if (normalizedUserEmail) {
-        const shares = await prisma.workflowShare.findMany({
-            where: { sharedWithEmail: normalizedUserEmail },
-            select: { workflowId: true },
-        });
-        const sharedIds = [
-            ...new Set(shares.map((share) => share.workflowId)),
-        ];
-        if (sharedIds.length > 0) {
-            const sharedWorkflows = await prisma.workflow.findMany({
-                where: { id: { in: sharedIds }, type: "assistant" },
-                select: { id: true, title: true, promptMd: true },
-            });
-            for (const wf of sharedWorkflows) {
-                if (wf.promptMd) {
-                    store.set(wf.id, {
-                        title: wf.title,
-                        prompt_md: wf.promptMd,
-                    });
-                }
-            }
-        }
-    }
-    return store;
+  }
+  return store;
 }
