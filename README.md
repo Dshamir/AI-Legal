@@ -1,5 +1,23 @@
 # Mike
 
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![CI](https://github.com/Dshamir/AI-Legal/actions/workflows/ci.yml/badge.svg)](https://github.com/Dshamir/AI-Legal/actions/workflows/ci.yml)
+
+![Next.js](https://img.shields.io/badge/Next.js-16-black?logo=next.js)
+![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript&logoColor=white)
+![Express](https://img.shields.io/badge/Express-4-000000?logo=express&logoColor=white)
+![Prisma](https://img.shields.io/badge/Prisma-7-2D3748?logo=prisma&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
+![Tailwind CSS](https://img.shields.io/badge/Tailwind_CSS-4-06B6D4?logo=tailwindcss&logoColor=white)
+![Zod](https://img.shields.io/badge/Zod-4-3E67B1?logo=zod&logoColor=white)
+![Vitest](https://img.shields.io/badge/Vitest-4-6E9F18?logo=vitest&logoColor=white)
+![MinIO](https://img.shields.io/badge/MinIO-S3_Compatible-C72E49?logo=minio&logoColor=white)
+![Nginx](https://img.shields.io/badge/Nginx-Reverse_Proxy-009639?logo=nginx&logoColor=white)
+![Pino](https://img.shields.io/badge/Pino-Structured_Logging-687634)
+
 Mike is a self-hosted legal document assistant with a Next.js frontend, Express backend, PostgreSQL (via Prisma ORM), GoTrue authentication, MinIO object storage, Redis caching, and GlitchTip error tracking. All 11 services are containerized and managed by a single orchestration script.
 
 Website: [mikeoss.com](https://mikeoss.com)
@@ -132,13 +150,18 @@ Mike uses **Prisma ORM** with PostgreSQL.
 
 ```bash
 # Run migrations
-npx prisma migrate dev --prefix backend
+cd backend && npx prisma migrate dev
 
 # Open visual editor
-npx prisma studio --prefix backend
+cd backend && npx prisma studio
 
 # Seed development data
-npx prisma db seed --prefix backend
+cd backend && npx prisma db seed
+
+# Or via the orchestration script (Docker)
+./ailegal.sh db:migrate
+./ailegal.sh db:seed
+./ailegal.sh db:studio
 ```
 
 Schema: `backend/prisma/schema.prisma` — 17 models with soft-delete on projects, documents, chats, workflows, and reviews. All mutations are logged to an `audit_log` table.
