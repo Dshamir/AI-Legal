@@ -1,27 +1,55 @@
 # Mike
 
-[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![CI](https://github.com/Dshamir/AI-Legal/actions/workflows/ci.yml/badge.svg)](https://github.com/Dshamir/AI-Legal/actions/workflows/ci.yml)
+<p align="center">
+  <img src="frontend/public/link-image.jpg" alt="Mike — AI Legal Document Assistant" width="600" />
+</p>
 
-![Next.js](https://img.shields.io/badge/Next.js-16-black?logo=next.js)
-![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white)
-![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript&logoColor=white)
-![Express](https://img.shields.io/badge/Express-4-000000?logo=express&logoColor=white)
-![Prisma](https://img.shields.io/badge/Prisma-7-2D3748?logo=prisma&logoColor=white)
-![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
-![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)
-![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
-![Tailwind CSS](https://img.shields.io/badge/Tailwind_CSS-4-06B6D4?logo=tailwindcss&logoColor=white)
-![Zod](https://img.shields.io/badge/Zod-4-3E67B1?logo=zod&logoColor=white)
-![Vitest](https://img.shields.io/badge/Vitest-4-6E9F18?logo=vitest&logoColor=white)
-![MinIO](https://img.shields.io/badge/MinIO-S3_Compatible-C72E49?logo=minio&logoColor=white)
-![Nginx](https://img.shields.io/badge/Nginx-Reverse_Proxy-009639?logo=nginx&logoColor=white)
-![Pino](https://img.shields.io/badge/Pino-Structured_Logging-687634)
-![MCP](https://img.shields.io/badge/MCP-Ready-8B5CF6)
+<p align="center">
+  <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/License-AGPL_3.0-blue.svg" alt="License: AGPL-3.0" /></a>
+  <a href="https://github.com/Dshamir/AI-Legal/actions/workflows/ci.yml"><img src="https://github.com/Dshamir/AI-Legal/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Next.js-16-black?logo=next.js" alt="Next.js" />
+  <img src="https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white" alt="React" />
+  <img src="https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript&logoColor=white" alt="TypeScript" />
+  <img src="https://img.shields.io/badge/Express-4-000000?logo=express&logoColor=white" alt="Express" />
+  <img src="https://img.shields.io/badge/Prisma-7-2D3748?logo=prisma&logoColor=white" alt="Prisma" />
+  <img src="https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white" alt="PostgreSQL" />
+  <img src="https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white" alt="Redis" />
+  <img src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white" alt="Docker" />
+  <img src="https://img.shields.io/badge/Tailwind_CSS-4-06B6D4?logo=tailwindcss&logoColor=white" alt="Tailwind CSS" />
+  <img src="https://img.shields.io/badge/Zod-4-3E67B1?logo=zod&logoColor=white" alt="Zod" />
+  <img src="https://img.shields.io/badge/Vitest-4-6E9F18?logo=vitest&logoColor=white" alt="Vitest" />
+  <img src="https://img.shields.io/badge/MinIO-S3_Compatible-C72E49?logo=minio&logoColor=white" alt="MinIO" />
+  <img src="https://img.shields.io/badge/Nginx-Reverse_Proxy-009639?logo=nginx&logoColor=white" alt="Nginx" />
+  <img src="https://img.shields.io/badge/Pino-Structured_Logging-687634" alt="Pino" />
+  <img src="https://img.shields.io/badge/MCP-Ready-8B5CF6" alt="MCP" />
+</p>
 
 **Mike** is a self-hosted, open-source legal document assistant. Upload contracts, analyze clauses, compare documents side-by-side, run reusable workflows, and chat with your documents using AI — all on infrastructure you own.
 
-Website: [mikeoss.com](https://mikeoss.com)
+> Forked from [willchen96/mike](https://github.com/willchen96/mike). Extended with self-hosted Docker infrastructure, Prisma ORM, structured logging, validation, error tracking, CI/CD, and a plugin-ready architecture.
+
+Website: [mikeoss.com](https://mikeoss.com) | [Changelog](CHANGELOG.md) | [Roadmap](ROADMAP.md) | [Contributing](CONTRIBUTING.md)
+
+---
+
+## Table of Contents
+
+- [Key Features](#key-features)
+- [Quick Start](#quick-start)
+- [Architecture](#architecture)
+- [Services](#services)
+- [Orchestration](#orchestration-ailegalsh)
+- [Prerequisites](#prerequisites)
+- [Environment](#environment)
+- [Development](#development)
+- [API Endpoints](#api-endpoints)
+- [Platform Roadmap](#platform-roadmap)
+- [Troubleshooting](#troubleshooting)
+- [Star History](#-star-history)
+- [Contributing](#contributing)
 
 ---
 
@@ -289,6 +317,31 @@ npm run lint --prefix frontend  # ESLint
 ```
 
 CI runs automatically via GitHub Actions on push/PR to `main` (lint, build matrix Node 20/22, test). Pre-commit hooks (Husky + lint-staged) auto-format staged files with Prettier.
+
+For testing with synthetic data and disposable infrastructure, see [`docs/safe-local-testing.md`](docs/safe-local-testing.md).
+
+---
+
+## API Endpoints
+
+All endpoints are served via Nginx at `/api/` and require GoTrue JWT authentication (except health check).
+
+| Route                            | Methods                | Purpose                                                     |
+| -------------------------------- | ---------------------- | ----------------------------------------------------------- |
+| `/health`                        | GET                    | Health check (unauthenticated)                              |
+| `/chat`                          | POST                   | AI chat with streaming (SSE), create chats, generate titles |
+| `/projects`                      | GET, POST, PUT, DELETE | Project CRUD, sharing, subfolder management                 |
+| `/projects/:projectId/chat`      | POST                   | Project-scoped AI chat with streaming                       |
+| `/projects/:projectId/documents` | GET, POST              | Document upload and listing within projects                 |
+| `/single-documents`              | GET, POST, PUT, DELETE | Standalone document CRUD, version management                |
+| `/tabular-review`                | GET, POST, PUT, DELETE | Tabular reviews, cell updates, review chat                  |
+| `/workflows`                     | GET, POST, PUT, DELETE | Workflow templates, sharing, hide/unhide                    |
+| `/user`                          | GET, PUT               | Profile, API key management (encrypted)                     |
+| `/downloads`                     | GET                    | Secure file downloads with HMAC-signed tokens               |
+
+Rate limiting is applied per-IP: chat endpoints (stricter), upload endpoints (stricter), general endpoints (standard).
+
+For full request/response schemas, see the Zod validation definitions in `backend/src/lib/validation/`.
 
 ---
 
