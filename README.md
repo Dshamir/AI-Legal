@@ -100,11 +100,17 @@ cd AI-Legal
 cp .env.example .env
 # Edit .env — add at least one LLM provider key (Anthropic, Gemini, or OpenAI)
 
-# 2. Start all 11 services
-./ailegal.sh up
+# 2. Build and start all 11 services
+./ailegal.sh build            # Build backend, frontend, and nginx images
+./ailegal.sh up               # Start the full stack (health-waited)
 
-# 3. Open http://localhost
+# 3. Run database migrations
+./ailegal.sh db:migrate       # Create tables via Prisma
+
+# 4. Open http://localhost
 ```
+
+> **First time?** You can also run `./ailegal.sh nuke` which does all of the above in one step (build + start + migrate + seed).
 
 Sign up, add an API key in **Account > Models & API Keys** if not set in `.env`, then create a project and start chatting with documents.
 
