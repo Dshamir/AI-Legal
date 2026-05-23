@@ -1,6 +1,7 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { requireAuth } from "../middleware/auth";
 import { createServerSupabase } from "../lib/supabase";
+import { logger } from "../lib/logger";
 
 export const workflowsRouter = Router();
 
@@ -56,7 +57,7 @@ async function loadSharerNames(
       .in("user_id", uniqueIds);
 
     if (error) {
-      console.warn("[workflows] failed to load sharer profiles", error);
+      logger.warn({ err: error }, "[workflows] failed to load sharer profiles");
     } else {
       for (const profile of profiles ?? []) {
         if (profile.user_id && profile.display_name) {
@@ -65,7 +66,7 @@ async function loadSharerNames(
       }
     }
   } catch (err) {
-    console.warn("[workflows] sharer profile lookup threw", err);
+    logger.warn({ err }, "[workflows] sharer profile lookup threw");
   }
 
   const missingIds = uniqueIds.filter((id) => !names.has(id));
@@ -81,7 +82,7 @@ async function loadSharerNames(
     if (result.status === "fulfilled" && result.value.email) {
       names.set(result.value.id, result.value.email);
     } else if (result.status === "rejected") {
-      console.warn("[workflows] failed to load sharer email", result.reason);
+      logger.warn({ err: result.reason }, "[workflows] failed to load sharer email");
     }
   }
 
@@ -422,7 +423,7 @@ workflowsRouter.post("/:workflowId/share", requireAuth, asyncRoute(async (req, r
 workflowsRouter.use(
   (err: unknown, _req: Request, res: Response, next: NextFunction) => {
     if (res.headersSent) return next(err);
-    console.error("[workflows] unhandled route error", err);
+    logger.error({ err }, "[workflows] unhandled route error");
     res.status(500).json({ detail: "Failed to process workflow request" });
   },
 );

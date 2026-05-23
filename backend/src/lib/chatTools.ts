@@ -1,4 +1,5 @@
 import path from "path";
+import { logger } from "./logger";
 import {
     downloadFile,
     generatedDocKey,
@@ -1487,16 +1488,16 @@ async function readDocumentContent(
     opts?: { emitEvents?: boolean },
 ): Promise<string> {
     const emitEvents = opts?.emitEvents ?? true;
-    console.log(`[read_document] called with docLabel="${docLabel}"`);
+    logger.info(`[read_document] called with docLabel="${docLabel}"`);
     const docInfo = docStore.get(docLabel);
     if (!docInfo) {
-        console.log(
-            `[read_document] MISS — docLabel "${docLabel}" not in docStore. Known labels:`,
-            Array.from(docStore.keys()),
+        logger.info(
+            { docLabel, knownLabels: Array.from(docStore.keys()) },
+            `[read_document] MISS — docLabel not in docStore`,
         );
         return "Document not found.";
     }
-    console.log(
+    logger.info(
         `[read_document] docInfo: filename="${docInfo.filename}", file_type="${docInfo.file_type}", storage_path="${docInfo.storage_path}"`,
     );
 
@@ -1532,11 +1533,11 @@ async function readDocumentContent(
                     current.bytes.byteOffset + current.bytes.byteLength,
                 ) as ArrayBuffer;
                 sourcePath = current.storage_path;
-                console.log(
+                logger.info(
                     `[read_document] using current version path="${sourcePath}" (bytes=${raw.byteLength})`,
                 );
             } else {
-                console.log(
+                logger.info(
                     `[read_document] loadCurrentVersionBytes returned null for documentId="${documentId}", falling back to original storage_path`,
                 );
             }
@@ -1544,13 +1545,13 @@ async function readDocumentContent(
         if (!raw) {
             raw = await downloadFile(docInfo.storage_path);
             if (raw) {
-                console.log(
+                logger.info(
                     `[read_document] fallback download from storage_path="${docInfo.storage_path}" (bytes=${raw.byteLength})`,
                 );
             }
         }
         if (!raw) {
-            console.log(
+            logger.info(
                 `[read_document] FAILED to download any bytes for docLabel="${docLabel}" (tried path="${sourcePath}")`,
             );
             emitDocRead();
@@ -1564,25 +1565,25 @@ async function readDocumentContent(
             const head = Buffer.from(raw).subarray(0, 8);
             const hex = head.toString("hex");
             const ascii = head.toString("binary").replace(/[^\x20-\x7e]/g, ".");
-            console.log(
+            logger.info(
                 `[read_document] magic bytes hex=${hex} ascii="${ascii}" for filename="${docInfo.filename}"`,
             );
         }
         let text: string;
         if (docInfo.file_type === "pdf") {
             text = await extractPdfText(raw);
-            console.log(
+            logger.info(
                 `[read_document] pdf extracted length=${text.length} for filename="${docInfo.filename}"`,
             );
         } else if (docInfo.file_type === "docx") {
             // Use the same flattening as the edit_document matcher so the
             // LLM sees exactly the characters it can anchor against.
             text = await extractDocxBodyText(Buffer.from(raw));
-            console.log(
+            logger.info(
                 `[read_document] docx extractDocxBodyText length=${text.length} for filename="${docInfo.filename}"`,
             );
             if (!text) {
-                console.log(
+                logger.info(
                     `[read_document] docx accepted-view extractor returned empty, falling back to mammoth for filename="${docInfo.filename}"`,
                 );
                 const mammoth = await import("mammoth");
@@ -1590,12 +1591,12 @@ async function readDocumentContent(
                     buffer: Buffer.from(raw),
                 });
                 text = result.value;
-                console.log(
+                logger.info(
                     `[read_document] docx mammoth fallback length=${text.length} for filename="${docInfo.filename}"`,
                 );
             }
         } else {
-            console.log(
+            logger.info(
                 `[read_document] unknown file_type="${docInfo.file_type}" for filename="${docInfo.filename}", trying mammoth`,
             );
             const mammoth = await import("mammoth");
@@ -1603,19 +1604,19 @@ async function readDocumentContent(
                 buffer: Buffer.from(raw),
             });
             text = result.value;
-            console.log(
+            logger.info(
                 `[read_document] mammoth length=${text.length} for filename="${docInfo.filename}"`,
             );
         }
-        console.log(
+        logger.info(
             `[read_document] DONE filename="${docInfo.filename}" finalTextLength=${text.length} firstChars=${JSON.stringify(text.slice(0, 120))}`,
         );
         emitDocRead();
         return text;
     } catch (err) {
-        console.log(
-            `[read_document] THREW for docLabel="${docLabel}" filename="${docInfo.filename}":`,
-            err,
+        logger.error(
+            { err, docLabel, filename: docInfo.filename },
+            "[read_document] THREW",
         );
         if (emitEvents)
             write(
@@ -2518,7 +2519,7 @@ export async function runToolCalls(
         } else if (tc.function.name === "generate_docx") {
             const title = args.title as string;
             const landscape = !!args.landscape;
-            console.log(
+            logger.info(
                 `[generate_docx] title="${title}" landscape=${landscape} args.landscape=${args.landscape}`,
             );
             const previewFilename = `${
@@ -3124,13 +3125,13 @@ export async function buildDocContext(
         }
     }
 
-    console.log(
-        "[buildDocContext] available docs:",
-        Object.entries(docIndex).map(([label, info]) => ({
+    logger.info(
+        { docs: Object.entries(docIndex).map(([label, info]) => ({
             label,
             filename: info.filename,
             document_id: info.document_id,
-        })),
+        })) },
+        "[buildDocContext] available docs",
     );
     return { docIndex, docStore };
 }
@@ -3217,14 +3218,14 @@ export async function buildProjectDocContext(
         if (path) folderPaths.set(docLabel, path);
     }
 
-    console.log(
-        "[buildProjectDocContext] available docs:",
-        Object.entries(docIndex).map(([label, info]) => ({
+    logger.info(
+        { docs: Object.entries(docIndex).map(([label, info]) => ({
             label,
             filename: info.filename,
             document_id: info.document_id,
             folder: folderPaths.get(label) ?? null,
-        })),
+        })) },
+        "[buildProjectDocContext] available docs",
     );
     return { docIndex, docStore, folderPaths };
 }

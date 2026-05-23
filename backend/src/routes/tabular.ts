@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth";
 import { createServerSupabase } from "../lib/supabase";
+import { logger } from "../lib/logger";
 import { downloadFile } from "../lib/storage";
 import { loadActiveVersion } from "../lib/documentVersions";
 import { normalizeDocxZipPaths } from "../lib/convert";
@@ -140,14 +141,14 @@ tabularRouter.get("/", requireAuth, async (req, res) => {
     // commonly the tabular_reviews.shared_with column hasn't been migrated
     // yet. Log and continue so the user still sees their own reviews.
     if (sharedErr)
-        console.warn(
-            "[tabular] shared-by-project query failed:",
-            sharedErr.message,
+        logger.warn(
+            { err: sharedErr },
+            "[tabular] shared-by-project query failed",
         );
     if (sharedDirectErr)
-        console.warn(
-            "[tabular] shared-by-email query failed:",
-            sharedDirectErr.message,
+        logger.warn(
+            { err: sharedDirectErr },
+            "[tabular] shared-by-email query failed",
         );
     const seen = new Set<string>();
     const reviews: Record<string, unknown>[] = [];
@@ -780,9 +781,9 @@ tabularRouter.post(
                             ? await extractPdfMarkdown(buf)
                             : await extractDocxMarkdown(buf);
                 } catch (err) {
-                    console.error(
-                        `[regenerate-cell] extraction error doc=${document_id}`,
-                        err,
+                    logger.error(
+                        { err, document_id },
+                        "[regenerate-cell] extraction error",
                     );
                 }
             }
@@ -913,9 +914,9 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
                                     ? await extractPdfMarkdown(buf)
                                     : await extractDocxMarkdown(buf);
                         } catch (err) {
-                            console.error(
-                                `[tabular/generate] extraction error doc=${docId}`,
-                                err,
+                            logger.error(
+                                { err, docId },
+                                "[tabular/generate] extraction error",
                             );
                         }
                     }
@@ -975,9 +976,9 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
                         api_keys,
                     );
                 } catch (err) {
-                    console.error(
-                        `[tabular/generate] queryTabularAllColumns error doc=${docId}`,
-                        err,
+                    logger.error(
+                        { err, docId },
+                        "[tabular/generate] queryTabularAllColumns error",
                     );
                 }
 
@@ -1000,7 +1001,7 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
 
         write("data: [DONE]\n\n");
     } catch (err) {
-        console.error("[tabular/generate] stream error", err);
+        logger.error({ err }, "[tabular/generate] stream error");
         try {
             write(
                 `data: ${JSON.stringify({ type: "error", message: String(err) })}\n\ndata: [DONE]\n\n`,
@@ -1398,7 +1399,7 @@ tabularRouter.post("/:reviewId/chat", requireAuth, async (req, res) => {
             }
         }
     } catch (err) {
-        console.error("[tabular/chat] error", err);
+        logger.error({ err }, "[tabular/chat] error");
         try {
             write(
                 `data: ${JSON.stringify({ type: "error", message: String(err) })}\n\n`,
@@ -1485,7 +1486,7 @@ The "summary" field must contain only the extracted value with inline citations 
             apiKeys,
         });
     } catch (err) {
-        console.error("[queryTabularCell] completion failed", err);
+        logger.error({ err }, "[queryTabularCell] completion failed");
         return null;
     }
     try {
@@ -1696,7 +1697,7 @@ Rules:
             },
         });
     } catch (err) {
-        console.error("[queryTabularAllColumns] stream failed", err);
+        logger.error({ err }, "[queryTabularAllColumns] stream failed");
     }
 
     if (contentBuffer.trim()) pending.push(processLine(contentBuffer));

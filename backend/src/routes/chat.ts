@@ -13,13 +13,14 @@ import {
 import { completeText } from "../lib/llm";
 import { getUserApiKeys, getUserModelSettings } from "../lib/userSettings";
 import { checkProjectAccess } from "../lib/access";
+import { logger } from "../lib/logger";
 
 export const chatRouter = Router();
 
 type Db = ReturnType<typeof createServerSupabase>;
 const isDev = process.env.NODE_ENV !== "production";
-const devLog = (...args: Parameters<typeof console.log>) => {
-    if (isDev) console.log(...args);
+const devLog = (msg: string, data?: Record<string, unknown>) => {
+    if (isDev) logger.debug(data ?? {}, msg);
 };
 
 type AccessibleChat = {
@@ -414,7 +415,7 @@ chatRouter.post("/:chatId/generate-title", requireAuth, async (req, res) => {
 
         res.json({ title });
     } catch (err) {
-        console.error("[generate-title]", err);
+        logger.error({ err }, "[generate-title]");
         res.status(500).json({ detail: "Failed to generate title" });
     }
 });
@@ -500,7 +501,7 @@ chatRouter.post("/", requireAuth, async (req, res) => {
             .select("id, title")
             .single();
         if (error || !newChat) {
-            console.error("[chat/stream] failed to create chat", error);
+            logger.error({ err: error }, "[chat/stream] failed to create chat");
             return void res
                 .status(500)
                 .json({ detail: "Failed to create chat" });
@@ -509,7 +510,7 @@ chatRouter.post("/", requireAuth, async (req, res) => {
         chatTitle = newChat.title;
     }
 
-    devLog("[chat/stream] resolved chatId", chatId);
+    devLog("[chat/stream] resolved chatId", { chatId });
 
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
     if (lastUser) {
@@ -594,7 +595,7 @@ chatRouter.post("/", requireAuth, async (req, res) => {
                 .eq("id", chatId);
         }
     } catch (err) {
-        console.error("[chat/stream] error:", err);
+        logger.error({ err }, "[chat/stream] error");
         try {
             write(
                 `data: ${JSON.stringify({ type: "error", message: "Stream error" })}\n\n`,

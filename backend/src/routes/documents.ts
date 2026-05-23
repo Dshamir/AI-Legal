@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth";
 import { createServerSupabase } from "../lib/supabase";
+import { logger } from "../lib/logger";
 import {
   buildContentDisposition,
   downloadFile,
@@ -435,7 +436,7 @@ documentsRouter.post(
         contentType,
       );
     } catch (e) {
-      console.error("[versions/upload] storage write failed", e);
+      logger.error({ err: e }, "[versions/upload] storage write failed");
       return void res
         .status(500)
         .json({ detail: "Failed to upload new version." });
@@ -459,10 +460,7 @@ documentsRouter.post(
         );
         pdfStoragePath = pdfKey;
       } catch (err) {
-        console.error(
-          `[versions/upload] DOCX→PDF conversion failed for ${file.originalname}:`,
-          err,
-        );
+        logger.error({ err, filename: file.originalname }, "[versions/upload] DOCX→PDF conversion failed");
       }
     } else if (suffix === "pdf") {
       // For PDF uploads, the uploaded bytes are themselves the PDF rendition.
@@ -501,7 +499,7 @@ documentsRouter.post(
       .select("id, version_number, source, created_at, display_name")
       .single();
     if (verErr || !versionRow) {
-      console.error("[versions/upload] insert failed", verErr);
+      logger.error({ err: verErr }, "[versions/upload] insert failed");
       return void res
         .status(500)
         .json({ detail: "Failed to record new version." });
@@ -632,11 +630,7 @@ async function handleEditResolution(
   const { documentId, editId } = req.params;
   const db = createServerSupabase();
 
-  console.log(`[edit-resolution] incoming ${mode}`, {
-    userId,
-    documentId,
-    editId,
-  });
+  logger.info({ mode, userId, documentId, editId }, "[edit-resolution] incoming");
 
   const { data: edit, error: editErr } = await db
     .from("document_edits")
@@ -644,31 +638,28 @@ async function handleEditResolution(
     .eq("id", editId)
     .eq("document_id", documentId)
     .single();
-  console.log(`[edit-resolution] fetched edit row`, { edit, editErr });
+  logger.info({ edit, editErr }, "[edit-resolution] fetched edit row");
   if (!edit) {
-    console.log(`[edit-resolution] edit not found, returning 404`);
+    logger.info(`[edit-resolution] edit not found, returning 404`);
     return void res.status(404).json({ detail: "Edit not found" });
   }
   // Idempotent: if the edit is already resolved, return the current doc
   // state so stale UI (e.g. an old chat reloaded in a new session) can
   // reconcile without throwing.
   if (edit.status !== "pending") {
-    console.log(`[edit-resolution] edit already resolved`, {
-      editId,
-      status: edit.status,
-    });
+    logger.info({ editId, status: edit.status }, "[edit-resolution] edit already resolved");
     const { data: doc } = await db
       .from("documents")
       .select("current_version_id, filename, user_id, project_id")
       .eq("id", documentId)
       .single();
     if (!doc) {
-      console.log(`[edit-resolution] doc not found for resolved edit`);
+      logger.info(`[edit-resolution] doc not found for resolved edit`);
       return void res.status(404).json({ detail: "Document not found" });
     }
     const accessResolved = await ensureDocAccess(doc, userId, userEmail, db);
     if (!accessResolved.ok) {
-      console.log(`[edit-resolution] doc access denied for resolved edit`);
+      logger.info(`[edit-resolution] doc access denied for resolved edit`);
       return void res.status(404).json({ detail: "Document not found" });
     }
     const activeForResolved = await loadActiveVersion(documentId, db);
@@ -685,7 +676,7 @@ async function handleEditResolution(
         : null,
       remaining_pending: 0,
     };
-    console.log(`[edit-resolution] returning already-resolved payload`, payload);
+    logger.info({ payload }, "[edit-resolution] returning already-resolved payload");
     return void res.status(200).json(payload);
   }
 
@@ -694,7 +685,7 @@ async function handleEditResolution(
     .select("id, current_version_id, user_id, project_id")
     .eq("id", documentId)
     .single();
-  console.log(`[edit-resolution] fetched doc`, { doc, docErr });
+  logger.info({ doc, docErr }, "[edit-resolution] fetched doc");
   if (!doc)
     return void res.status(404).json({ detail: "Document not found" });
   const access = await ensureDocAccess(doc, userId, userEmail, db);
@@ -703,17 +694,12 @@ async function handleEditResolution(
 
   const active = await loadActiveVersion(documentId, db);
   const latestPath = active?.storage_path ?? null;
-  console.log(`[edit-resolution] resolved latestPath`, {
-    latestPath,
-    current_version_id: doc.current_version_id,
-  });
+  logger.info({ latestPath, current_version_id: doc.current_version_id }, "[edit-resolution] resolved latestPath");
   if (!latestPath)
     return void res.status(404).json({ detail: "No file to edit" });
 
   const raw = await downloadFile(latestPath);
-  console.log(`[edit-resolution] downloaded bytes`, {
-    byteLength: raw?.byteLength ?? 0,
-  });
+  logger.info({ byteLength: raw?.byteLength ?? 0 }, "[edit-resolution] downloaded bytes");
   if (!raw)
     return void res.status(404).json({ detail: "Document bytes not available" });
 
@@ -725,15 +711,9 @@ async function handleEditResolution(
     wIds,
     mode,
   );
-  console.log(`[edit-resolution] resolveTrackedChange result`, {
-    mode,
-    change_id: edit.change_id,
-    wIds,
-    found,
-    resolvedByteLength: resolvedBytes?.byteLength ?? 0,
-  });
+  logger.info({ mode, change_id: edit.change_id, wIds, found, resolvedByteLength: resolvedBytes?.byteLength ?? 0 }, "[edit-resolution] resolveTrackedChange result");
   if (!found) {
-    console.log(
+    logger.info(
       `[edit-resolution] change_id not found in docx — updating status only`,
     );
     // Still update DB status so the UI reflects the decision — the change
@@ -742,7 +722,7 @@ async function handleEditResolution(
       .from("document_edits")
       .update({ status: mode === "accept" ? "accepted" : "rejected", resolved_at: new Date().toISOString() })
       .eq("id", editId);
-    console.log(`[edit-resolution] status-only update`, { updErr });
+    logger.info({ updErr }, "[edit-resolution] status-only update");
     const { data: filenameRow } = await db
       .from("documents")
       .select("filename")
@@ -757,7 +737,7 @@ async function handleEditResolution(
       ),
       remaining_pending: 0,
     };
-    console.log(`[edit-resolution] returning not-found payload`, payload);
+    logger.info({ payload }, "[edit-resolution] returning not-found payload");
     return void res.status(200).json(payload);
   }
 
@@ -770,10 +750,7 @@ async function handleEditResolution(
     resolvedBytes.byteOffset,
     resolvedBytes.byteOffset + resolvedBytes.byteLength,
   ) as ArrayBuffer;
-  console.log(`[edit-resolution] overwriting bytes in place`, {
-    latestPath,
-    byteLength: ab.byteLength,
-  });
+  logger.info({ latestPath, byteLength: ab.byteLength }, "[edit-resolution] overwriting bytes in place");
   await uploadFile(
     latestPath,
     ab,
@@ -787,18 +764,14 @@ async function handleEditResolution(
       resolved_at: new Date().toISOString(),
     })
     .eq("id", editId);
-  console.log(`[edit-resolution] updated document_edits status`, {
-    editId,
-    newStatus: mode === "accept" ? "accepted" : "rejected",
-    statusErr,
-  });
+  logger.info({ editId, newStatus: mode === "accept" ? "accepted" : "rejected", statusErr }, "[edit-resolution] updated document_edits status");
 
   const { count: remainingPending } = await db
     .from("document_edits")
     .select("id", { count: "exact", head: true })
     .eq("document_id", documentId)
     .eq("status", "pending");
-  console.log(`[edit-resolution] remaining pending count`, { remainingPending });
+  logger.info({ remainingPending }, "[edit-resolution] remaining pending count");
 
   const { data: filenameRow } = await db
     .from("documents")
@@ -814,7 +787,7 @@ async function handleEditResolution(
     ),
     remaining_pending: remainingPending ?? 0,
   };
-  console.log(`[edit-resolution] returning success payload`, payload);
+  logger.info({ payload }, "[edit-resolution] returning success payload");
   res.json(payload);
 }
 
@@ -908,10 +881,7 @@ async function handleDocumentUpload(
         );
         pdfStoragePath = pdfKey;
       } catch (err) {
-        console.error(
-          `[upload] DOCX→PDF conversion failed for ${filename}:`,
-          err,
-        );
+        logger.error({ err, filename }, "[upload] DOCX→PDF conversion failed");
       }
     } else if (suffix === "pdf") {
       pdfStoragePath = key;

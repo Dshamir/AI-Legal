@@ -3,6 +3,10 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
+import { initErrorTracking } from "./lib/errorTracking";
+import { requestId } from "./middleware/requestId";
+import { globalErrorHandler } from "./middleware/errorHandler";
+import { logger } from "./lib/logger";
 import { chatRouter } from "./routes/chat";
 import { projectsRouter } from "./routes/projects";
 import { projectChatRouter } from "./routes/projectChat";
@@ -11,6 +15,8 @@ import { tabularRouter } from "./routes/tabular";
 import { workflowsRouter } from "./routes/workflows";
 import { userRouter } from "./routes/user";
 import { downloadsRouter } from "./routes/downloads";
+
+initErrorTracking();
 
 const app = express();
 const PORT = process.env.PORT ?? 3001;
@@ -76,13 +82,21 @@ app.set("trust proxy", envInt("TRUST_PROXY_HOPS", 1));
 
 app.use(
   helmet({
-    contentSecurityPolicy: false,
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:", "blob:"],
+        connectSrc: ["'self'", process.env.FRONTEND_URL ?? "http://localhost:3000"],
+        fontSrc: ["'self'"],
+        objectSrc: ["'none'"],
+        frameAncestors: ["'none'"],
+      },
+    },
     crossOriginEmbedderPolicy: false,
     hsts: isProduction
-      ? {
-          maxAge: 15552000,
-          includeSubDomains: true,
-        }
+      ? { maxAge: 15552000, includeSubDomains: true }
       : false,
     referrerPolicy: { policy: "no-referrer" },
   }),
@@ -98,6 +112,8 @@ app.use(
 app.use(generalLimiter);
 
 app.use(express.json({ limit: "50mb" }));
+
+app.use(requestId);
 
 app.post("/chat", chatLimiter);
 app.post("/projects/:projectId/chat", chatLimiter);
@@ -121,6 +137,8 @@ app.use("/download", downloadsRouter);
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
+app.use(globalErrorHandler);
+
 app.listen(PORT, () => {
-  console.log(`Mike backend running on port ${PORT}`);
+  logger.info({ port: PORT }, "Mike backend running");
 });

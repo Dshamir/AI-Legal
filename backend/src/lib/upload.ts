@@ -51,6 +51,7 @@ export async function validateFileType(
     return { valid: false, detectedType: `disallowed extension: .${ext}` };
   }
 
+  // @ts-ignore — file-type is ESM-only, works at runtime
   const { fileTypeFromBuffer } = await import("file-type");
   const detected = await fileTypeFromBuffer(buffer);
 

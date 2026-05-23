@@ -2,6 +2,7 @@ import { Router } from "express";
 import { requireAuth } from "../middleware/auth";
 import { createServerSupabase } from "../lib/supabase";
 import { createClient } from "@supabase/supabase-js";
+import { logger } from "../lib/logger";
 import {
   attachActiveVersionPaths,
   attachLatestVersionNumbers,
@@ -766,10 +767,7 @@ export async function handleDocumentUpload(
         );
         pdfStoragePath = pdfKey;
       } catch (err) {
-        console.error(
-          `[upload] DOCX→PDF conversion failed for ${filename}:`,
-          err,
-        );
+        logger.error({ err, filename }, "[upload] DOCX→PDF conversion failed");
       }
     } else if (suffix === "pdf") {
       pdfStoragePath = key;

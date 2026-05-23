@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import { createServerSupabase } from "./supabase";
 import type { UserApiKeys } from "./llm";
+import { logger } from "./logger";
 
 type Db = ReturnType<typeof createServerSupabase>;
 export type ApiKeyProvider = "claude" | "gemini" | "openai";
@@ -72,10 +73,7 @@ function decrypt(row: EncryptedKeyRow): string | null {
         ]);
         return decrypted.toString("utf8");
     } catch (err) {
-        console.error("[user-api-keys] failed to decrypt stored key", {
-            provider: row.provider,
-            error: err instanceof Error ? err.message : String(err),
-        });
+        logger.error({ provider: row.provider, err }, "[user-api-keys] failed to decrypt stored key");
         return null;
     }
 }

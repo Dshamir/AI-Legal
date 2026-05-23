@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth";
 import { createServerSupabase } from "../lib/supabase";
+import { logger } from "../lib/logger";
 import { DEFAULT_TABULAR_MODEL, resolveModel } from "../lib/llm";
 import {
   type ApiKeyStatus,
@@ -245,10 +246,7 @@ userRouter.put("/api-keys/:provider", requireAuth, async (req, res) => {
     const status = await getUserApiKeyStatus(userId, db);
     res.json(status);
   } catch (err) {
-    console.error("[user/api-keys] save failed", {
-      provider,
-      error: err instanceof Error ? err.message : String(err),
-    });
+    logger.error({ err, provider }, "[user/api-keys] save failed");
     res.status(500).json({ detail: "Failed to save API key" });
   }
 });
