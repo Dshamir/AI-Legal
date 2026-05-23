@@ -1,7 +1,8 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Get a free hosted Postgres database in seconds: `npx create-db`
+// ---------------------------------------------------------------------------
+// Mike – Prisma schema
+// Auto-generated from schema.sql. Every table, index, enum and relation from
+// the SQL file is represented here plus a new AuditLog model.
+// ---------------------------------------------------------------------------
 
 generator client {
   provider = "prisma-client"
@@ -10,4 +11,403 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+}
+
+// ===========================================================================
+// Enums
+// ===========================================================================
+
+enum Visibility {
+  private_ @map("private")
+  shared
+  public_  @map("public")
+}
+
+enum UserTier {
+  Free
+  Pro
+  Enterprise
+}
+
+enum DocumentStatus {
+  pending
+  processing
+  ready
+  failed
+}
+
+enum EditStatus {
+  pending
+  accepted
+  rejected
+}
+
+enum ApiKeyProvider {
+  claude
+  gemini
+  openai
+}
+
+enum VersionSource {
+  upload
+  user_upload
+  assistant_edit
+  user_accept
+  user_reject
+  generated
+}
+
+enum TabularCellStatus {
+  pending
+  generating
+  complete
+  failed
+}
+
+// ===========================================================================
+// User profiles & API keys
+// ===========================================================================
+
+model UserProfile {
+  id                 String   @id @default(uuid()) @db.Uuid
+  userId             String   @unique @map("user_id") @db.Uuid
+  displayName        String?  @map("display_name")
+  organisation       String?
+  tier               UserTier @default(Free)
+  messageCreditsUsed Int      @default(0) @map("message_credits_used")
+  creditsResetDate   DateTime @default(dbgenerated("(now() + '30 days'::interval)")) @map("credits_reset_date") @db.Timestamptz
+  tabularModel       String   @default("gemini-3-flash-preview") @map("tabular_model")
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt          DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@index([userId], map: "idx_user_profiles_user")
+  @@map("user_profiles")
+}
+
+model UserApiKey {
+  id           String         @id @default(uuid()) @db.Uuid
+  userId       String         @map("user_id") @db.Uuid
+  provider     ApiKeyProvider
+  encryptedKey String         @map("encrypted_key")
+  iv           String
+  authTag      String         @map("auth_tag")
+  createdAt    DateTime       @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime       @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@unique([userId, provider])
+  @@index([userId], map: "idx_user_api_keys_user")
+  @@map("user_api_keys")
+}
+
+// ===========================================================================
+// Projects & subfolders
+// ===========================================================================
+
+model Project {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @map("user_id")
+  name       String
+  cmNumber   String?  @map("cm_number")
+  visibility Visibility @default(private_)
+  sharedWith Json     @default("[]") @map("shared_with") @db.JsonB
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt  DateTime? @map("deleted_at")
+
+  // Relations
+  subfolders     ProjectSubfolder[]
+  documents      Document[]
+  chats          Chat[]
+  tabularReviews TabularReview[]
+
+  @@index([userId], map: "idx_projects_user")
+  @@index([sharedWith], map: "projects_shared_with_idx", type: Gin)
+  @@map("projects")
+}
+
+model ProjectSubfolder {
+  id             String   @id @default(uuid()) @db.Uuid
+  projectId      String   @map("project_id") @db.Uuid
+  userId         String   @map("user_id")
+  name           String
+  parentFolderId String?  @map("parent_folder_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  project      Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  parentFolder ProjectSubfolder? @relation("SubfolderTree", fields: [parentFolderId], references: [id], onDelete: Cascade)
+  children     ProjectSubfolder[] @relation("SubfolderTree")
+  documents    Document[]
+
+  @@index([projectId], map: "idx_project_subfolders_project")
+  @@map("project_subfolders")
+}
+
+// ===========================================================================
+// Documents, versions & edits
+// ===========================================================================
+
+model Document {
+  id               String          @id @default(uuid()) @db.Uuid
+  projectId        String?         @map("project_id") @db.Uuid
+  userId           String          @map("user_id")
+  filename         String
+  fileType         String?         @map("file_type")
+  sizeBytes        Int             @default(0) @map("size_bytes")
+  pageCount        Int?            @map("page_count")
+  structureTree    Json?           @map("structure_tree") @db.JsonB
+  status           DocumentStatus  @default(pending)
+  folderId         String?         @map("folder_id") @db.Uuid
+  currentVersionId String?         @map("current_version_id") @db.Uuid
+  createdAt        DateTime        @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt        DateTime?       @map("deleted_at")
+
+  // Relations
+  project        Project?          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  folder         ProjectSubfolder? @relation(fields: [folderId], references: [id], onDelete: SetNull)
+  currentVersion DocumentVersion?  @relation("CurrentVersion", fields: [currentVersionId], references: [id], onDelete: SetNull)
+  versions       DocumentVersion[] @relation("DocumentVersions")
+  edits          DocumentEdit[]
+  tabularCells   TabularCell[]
+
+  @@index([userId, projectId], map: "idx_documents_user_project")
+  @@index([projectId, folderId], map: "idx_documents_project_folder")
+  @@map("documents")
+}
+
+model DocumentVersion {
+  id             String        @id @default(uuid()) @db.Uuid
+  documentId     String        @map("document_id") @db.Uuid
+  storagePath    String        @map("storage_path")
+  pdfStoragePath String?       @map("pdf_storage_path")
+  source         VersionSource @default(upload)
+  versionNumber  Int?          @map("version_number")
+  displayName    String?       @map("display_name")
+  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  deletedAt      DateTime?     @map("deleted_at")
+
+  // Relations
+  document          Document       @relation("DocumentVersions", fields: [documentId], references: [id], onDelete: Cascade)
+  currentOfDocument Document[]     @relation("CurrentVersion")
+  edits             DocumentEdit[]
+
+  @@index([documentId, createdAt(sort: Desc)], map: "document_versions_document_id_idx")
+  @@index([documentId, versionNumber], map: "document_versions_doc_vnum_idx")
+  @@map("document_versions")
+}
+
+model DocumentEdit {
+  id            String     @id @default(uuid()) @db.Uuid
+  documentId    String     @map("document_id") @db.Uuid
+  chatMessageId String?    @map("chat_message_id") @db.Uuid
+  versionId     String     @map("version_id") @db.Uuid
+  changeId      String     @map("change_id")
+  delWId        String?    @map("del_w_id")
+  insWId        String?    @map("ins_w_id")
+  deletedText   String     @default("") @map("deleted_text")
+  insertedText  String     @default("") @map("inserted_text")
+  contextBefore String?    @map("context_before")
+  contextAfter  String?    @map("context_after")
+  status        EditStatus @default(pending)
+  createdAt     DateTime   @default(now()) @map("created_at") @db.Timestamptz
+  resolvedAt    DateTime?  @map("resolved_at") @db.Timestamptz
+
+  // Relations
+  document    Document         @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  version     DocumentVersion  @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  chatMessage ChatMessage?     @relation(fields: [chatMessageId], references: [id], onDelete: SetNull)
+
+  @@index([documentId, createdAt(sort: Desc)], map: "document_edits_document_id_idx")
+  @@index([chatMessageId], map: "document_edits_message_id_idx")
+  @@index([versionId], map: "document_edits_version_id_idx")
+  @@map("document_edits")
+}
+
+// ===========================================================================
+// Workflows
+// ===========================================================================
+
+model Workflow {
+  id            String   @id @default(uuid()) @db.Uuid
+  userId        String?  @map("user_id")
+  title         String
+  type          String
+  promptMd      String?  @map("prompt_md")
+  columnsConfig Json?    @map("columns_config") @db.JsonB
+  practice      String?
+  isSystem      Boolean  @default(false) @map("is_system")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+  deletedAt     DateTime? @map("deleted_at")
+
+  // Relations
+  shares         WorkflowShare[]
+  tabularReviews TabularReview[]
+
+  @@index([userId], map: "idx_workflows_user")
+  @@map("workflows")
+}
+
+model HiddenWorkflow {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @map("user_id")
+  workflowId String   @map("workflow_id")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@unique([userId, workflowId])
+  @@index([userId], map: "idx_hidden_workflows_user")
+  @@map("hidden_workflows")
+}
+
+model WorkflowShare {
+  id              String   @id @default(uuid()) @db.Uuid
+  workflowId      String   @map("workflow_id") @db.Uuid
+  sharedByUserId  String   @map("shared_by_user_id")
+  sharedWithEmail String   @map("shared_with_email")
+  allowEdit       Boolean  @default(false) @map("allow_edit")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  workflow Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  @@unique([workflowId, sharedWithEmail], map: "workflow_shares_workflow_email_unique")
+  @@index([workflowId], map: "workflow_shares_workflow_id_idx")
+  @@index([sharedWithEmail], map: "workflow_shares_email_idx")
+  @@map("workflow_shares")
+}
+
+// ===========================================================================
+// Assistant chats
+// ===========================================================================
+
+model Chat {
+  id        String   @id @default(uuid()) @db.Uuid
+  projectId String?  @map("project_id") @db.Uuid
+  userId    String   @map("user_id")
+  title     String?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  deletedAt DateTime? @map("deleted_at")
+
+  // Relations
+  project  Project?      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  messages ChatMessage[]
+
+  @@index([userId], map: "idx_chats_user")
+  @@index([projectId], map: "idx_chats_project")
+  @@map("chats")
+}
+
+model ChatMessage {
+  id          String   @id @default(uuid()) @db.Uuid
+  chatId      String   @map("chat_id") @db.Uuid
+  role        String
+  content     Json?    @db.JsonB
+  files       Json?    @db.JsonB
+  annotations Json?    @db.JsonB
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  chat  Chat           @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  edits DocumentEdit[]
+
+  @@index([chatId], map: "idx_chat_messages_chat")
+  @@map("chat_messages")
+}
+
+// ===========================================================================
+// Tabular reviews
+// ===========================================================================
+
+model TabularReview {
+  id            String   @id @default(uuid()) @db.Uuid
+  projectId     String?  @map("project_id") @db.Uuid
+  userId        String   @map("user_id")
+  title         String?
+  columnsConfig Json?    @map("columns_config") @db.JsonB
+  documentIds   Json?    @map("document_ids") @db.JsonB
+  workflowId    String?  @map("workflow_id") @db.Uuid
+  practice      String?
+  sharedWith    Json     @default("[]") @map("shared_with") @db.JsonB
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt     DateTime? @map("deleted_at")
+
+  // Relations
+  project  Project?             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  workflow Workflow?            @relation(fields: [workflowId], references: [id], onDelete: SetNull)
+  cells    TabularCell[]
+  chats    TabularReviewChat[]
+
+  @@index([userId], map: "idx_tabular_reviews_user")
+  @@index([projectId], map: "idx_tabular_reviews_project")
+  @@index([sharedWith], map: "tabular_reviews_shared_with_idx", type: Gin)
+  @@map("tabular_reviews")
+}
+
+model TabularCell {
+  id          String             @id @default(uuid()) @db.Uuid
+  reviewId    String             @map("review_id") @db.Uuid
+  documentId  String             @map("document_id") @db.Uuid
+  columnIndex Int                @map("column_index")
+  content     String?
+  citations   Json?              @db.JsonB
+  status      TabularCellStatus  @default(pending)
+  createdAt   DateTime           @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  review   TabularReview @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  document Document      @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([reviewId, documentId, columnIndex], map: "idx_tabular_cells_review")
+  @@map("tabular_cells")
+}
+
+model TabularReviewChat {
+  id        String   @id @default(uuid()) @db.Uuid
+  reviewId  String   @map("review_id") @db.Uuid
+  userId    String   @map("user_id")
+  title     String?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  review   TabularReview                @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  messages TabularReviewChatMessage[]
+
+  @@index([reviewId, updatedAt(sort: Desc)], map: "tabular_review_chats_review_idx")
+  @@index([userId], map: "tabular_review_chats_user_idx")
+  @@map("tabular_review_chats")
+}
+
+model TabularReviewChatMessage {
+  id          String   @id @default(uuid()) @db.Uuid
+  chatId      String   @map("chat_id") @db.Uuid
+  role        String
+  content     Json?    @db.JsonB
+  annotations Json?    @db.JsonB
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  chat TabularReviewChat @relation(fields: [chatId], references: [id], onDelete: Cascade)
+
+  @@index([chatId, createdAt], map: "tabular_review_chat_messages_chat_idx")
+  @@map("tabular_review_chat_messages")
+}
+
+// ===========================================================================
+// Audit log (new – not in schema.sql)
+// ===========================================================================
+
+model AuditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  action    String
+  entity    String
+  entityId  String   @map("entity_id") @db.Uuid
+  changes   Json?    @db.JsonB
+  ipAddress String?  @map("ip_address")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("audit_log")
 }
