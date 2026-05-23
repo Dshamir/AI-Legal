@@ -113,13 +113,129 @@ Move all long-running and CPU-heavy work (PDF/OCR ingestion, embedding generatio
 
 ---
 
+## Foundation: Plugin & MCP Architecture
+
+> This is the architectural direction that gates all proposed upgrades below. Build the platform layer first, then every new feature plugs in rather than being bolted on.
+
+Mike's core stays lean — documents, projects, chat, workflows, tabular reviews. Everything else is extensible through three mechanisms:
+
+### MCP Server (Mike exposes its capabilities)
+
+Mike runs an MCP-compliant server so any MCP client (Claude Code, Cursor, custom agents, external tools) can programmatically:
+
+- Search and retrieve documents, projects, and chat history
+- Trigger document analysis and comparison
+- Query tabular review data
+- Execute workflows
+
+**Interface:** Standard MCP SSE transport, authenticated via GoTrue JWT, exposed at `/mcp/`.
+
+### MCP Client (Mike consumes external services)
+
+Mike connects to external MCP servers for capabilities it doesn't own:
+
+| External MCP Server   | Capability                                                |
+| --------------------- | --------------------------------------------------------- |
+| `tfai-vault`          | Credential management, API key vault, operator onboarding |
+| Legal databases       | Case law lookup, citation verification                    |
+| Enterprise connectors | Slack, email, calendar integrations                       |
+
+### Plugin System
+
+Plugins register through a standardized interface — backend routes, frontend pages, MCP tools, and worker queues. No core code changes required to add a plugin.
+
+| Plugin                      | What it provides                                                          | Source                                                                                             |
+| --------------------------- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `@mike/knowledge-base`      | Article management, categories, search, markdown editor                   | [`proposed-upgrades/KB-to add/`](proposed-upgrades/KB-to%20add/)                                   |
+| `@mike/custom-agents`       | Agent builder, provider binding, prompt tuning, skills, test harness      | [`proposed-upgrades/KB-to add/custom-agents/`](proposed-upgrades/KB-to%20add/custom-agents/)       |
+| `@mike/prompt-templates`    | Reusable prompt library with `{{variables}}`, test execution              | [`proposed-upgrades/KB-to add/prompt-templates/`](proposed-upgrades/KB-to%20add/prompt-templates/) |
+| `@mike/ai-settings`         | Named providers, per-provider rate limits, cost tracking, usage dashboard | [`proposed-upgrades/KB-to add/ai-settings/`](proposed-upgrades/KB-to%20add/ai-settings/)           |
+| `@mike/mission-dashboard`   | MCP audit log viewer, operator tracking, vault KPIs                       | [`proposed-upgrades/mission-dashboard/`](proposed-upgrades/mission-dashboard/)                     |
+| `@mike/distributed-workers` | BullMQ queues, Bull-Board dashboard, worker fleet                         | See [Distributed CPU Workers](#proposed-upgrade-distributed-cpu-workers)                           |
+
+### Phased Rollout
+
+| Phase                          | Goal                       | Scope                                                                     |
+| ------------------------------ | -------------------------- | ------------------------------------------------------------------------- |
+| **Phase 1** — Plugin Interface | Define plugin contract     | Route registration, UI page mounting, MCP tool declaration, config schema |
+| **Phase 2** — MCP Server       | Mike as MCP provider       | SSE transport, tool definitions for documents/projects/chat/workflows     |
+| **Phase 3** — MCP Client       | Mike consumes external MCP | Credential vault integration, external knowledge sources                  |
+| **Phase 4** — Plugin Registry  | Install/uninstall plugins  | Plugin manifest, dependency resolution, admin UI for plugin management    |
+
+---
+
+## Proposed Upgrade: LLM Compute Providers
+
+Extend Mike's existing multi-LLM provider abstraction (`backend/src/lib/llm/`) to support self-hosted models and cloud GPU compute alongside the current hosted API providers.
+
+### Local LLM Support (Ollama / vLLM)
+
+Run inference on local hardware — fully air-gapped, zero API costs, full data sovereignty.
+
+| Component  | Role                                                                                                                                          |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Ollama** | Drop-in local inference server. Single binary, runs quantized models (Llama, Mistral, Phi, Qwen). Best for development and small deployments. |
+| **vLLM**   | Production-grade serving with continuous batching, PagedAttention, OpenAI-compatible API. Best for multi-user deployments with GPU hardware.  |
+
+**Integration:** Both expose OpenAI-compatible `/v1/chat/completions` endpoints. Mike's provider abstraction already supports OpenAI — local LLMs register as a provider with a local `baseUrl` (e.g., `http://ollama:11434/v1`). No new code path required.
+
+**Docker Compose addition:**
+
+```yaml
+ollama:
+  image: ollama/ollama
+  volumes: [ollama-models:/root/.ollama]
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+```
+
+**Model management:** Pull models via `./ailegal.sh llm:pull <model>`, list with `./ailegal.sh llm:list`, switch per-user in Account settings.
+
+### AWS GPU Compute
+
+Burst to cloud GPUs for heavy workloads (large document batches, fine-tuning, embedding generation at scale) without maintaining local GPU hardware.
+
+| Option                        | Use Case                                          | Integration                                                         |
+| ----------------------------- | ------------------------------------------------- | ------------------------------------------------------------------- |
+| **AWS Bedrock**               | Managed inference (Claude, Llama, Mistral on AWS) | OpenAI-compatible via Bedrock runtime SDK. Registers as a provider. |
+| **SageMaker Endpoints**       | Custom/fine-tuned models                          | Deploy custom model, expose as endpoint, register `baseUrl` in Mike |
+| **EC2 GPU Instances** (g5/p4) | Self-managed vLLM on cloud GPU                    | Same vLLM integration as local, just remote `baseUrl`               |
+| **Lambda + EFS**              | Serverless inference for bursty workloads         | Triggered via BullMQ worker queue (requires distributed workers)    |
+
+**Architecture with distributed workers:**
+
+```
+User request → Backend (enqueue) → Redis/BullMQ
+                                       ↓
+                              ┌────────────────────┐
+                              │   Worker Fleet      │
+                              ├────────────────────┤
+                              │ Local Ollama/vLLM  │ ← dev / small
+                              │ AWS Bedrock        │ ← managed cloud
+                              │ SageMaker endpoint │ ← custom models
+                              │ EC2 GPU (vLLM)     │ ← heavy batch
+                              └────────────────────┘
+```
+
+**Cost control:** Route by model size and urgency. Small queries → local Ollama (free). Large batch jobs → AWS GPU (pay per use). The AI Settings plugin provides cost tracking and budget alerts per provider.
+
+**Status:** Depends on Plugin & MCP Architecture (Phase 1) and optionally Distributed CPU Workers (for async GPU dispatch).
+
+---
+
 ## Future Considerations
 
 These are longer-term ideas under evaluation — not yet committed to the roadmap.
 
 - **Multi-tenant support** — workspace isolation, per-tenant billing, admin dashboard
-- **Plugin system** — extensible document processors and analysis pipelines
 - **Collaborative editing** — real-time multi-user document annotation (CRDT-based)
-- **Audit log dashboard** — searchable UI for the existing audit trail
-- **Self-hosted LLM support** — Ollama/vLLM integration for fully air-gapped deployments
+- **Client portal** — read-only external access for clients to review documents
+- **SSO/SAML** — enterprise auth (Okta, Azure AD) alongside GoTrue
+- **RAG pipeline** — vector embeddings + semantic search over document corpus
+- **Clause library** — extract, tag, and reuse standard clauses across contracts
 - **Mobile app** — React Native companion for document review on the go
