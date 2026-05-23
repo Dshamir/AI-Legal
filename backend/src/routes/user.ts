@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth";
-import { createServerSupabase } from "../lib/supabase";
+import { prisma } from "../lib/prisma";
 import { logger } from "../lib/logger";
 import { DEFAULT_TABULAR_MODEL, resolveModel } from "../lib/llm";
 import {
@@ -10,33 +10,35 @@ import {
   normalizeApiKeyProvider,
   saveUserApiKey,
 } from "../lib/userApiKeys";
+import { auditLog } from "../lib/audit";
+import { createClient } from "@supabase/supabase-js";
 
 export const userRouter = Router();
 
 const MONTHLY_CREDIT_LIMIT = 999999;
 
 type UserProfileRow = {
-  display_name: string | null;
+  displayName: string | null;
   organisation: string | null;
-  message_credits_used: number;
-  credits_reset_date: string;
+  messageCreditsUsed: number;
+  creditsResetDate: Date;
   tier: string;
-  tabular_model: string;
+  tabularModel: string;
 };
 
 function serializeProfile(
   row: UserProfileRow,
   apiKeyStatus?: ApiKeyStatus,
 ) {
-  const creditsUsed = row.message_credits_used ?? 0;
+  const creditsUsed = row.messageCreditsUsed ?? 0;
   return {
-    displayName: row.display_name,
+    displayName: row.displayName,
     organisation: row.organisation,
     messageCreditsUsed: creditsUsed,
-    creditsResetDate: row.credits_reset_date,
+    creditsResetDate: row.creditsResetDate.toISOString(),
     creditsRemaining: Math.max(MONTHLY_CREDIT_LIMIT - creditsUsed, 0),
     tier: row.tier || "Free",
-    tabularModel: resolveModel(row.tabular_model, DEFAULT_TABULAR_MODEL),
+    tabularModel: resolveModel(row.tabularModel, DEFAULT_TABULAR_MODEL),
     ...(apiKeyStatus ? { apiKeyStatus } : {}),
   };
 }
@@ -45,10 +47,9 @@ function validateProfilePayload(body: unknown):
   | {
       ok: true;
       update: {
-        display_name?: string | null;
+        displayName?: string | null;
         organisation?: string | null;
-        tabular_model?: string;
-        updated_at: string;
+        tabularModel?: string;
       };
     }
   | { ok: false; detail: string } {
@@ -68,17 +69,16 @@ function validateProfilePayload(body: unknown):
   }
 
   const update: {
-    display_name?: string | null;
+    displayName?: string | null;
     organisation?: string | null;
-    tabular_model?: string;
-    updated_at: string;
-  } = { updated_at: new Date().toISOString() };
+    tabularModel?: string;
+  } = {};
 
   if ("displayName" in raw) {
     if (raw.displayName !== null && typeof raw.displayName !== "string") {
       return { ok: false, detail: "displayName must be a string or null" };
     }
-    update.display_name = raw.displayName?.trim() || null;
+    update.displayName = raw.displayName?.trim() || null;
   }
 
   if ("organisation" in raw) {
@@ -96,100 +96,89 @@ function validateProfilePayload(body: unknown):
     if (!resolved) {
       return { ok: false, detail: "Unsupported tabularModel" };
     }
-    update.tabular_model = resolved;
+    update.tabularModel = resolved;
   }
 
   return { ok: true, update };
 }
 
-async function ensureProfileRow(
-  db: ReturnType<typeof createServerSupabase>,
-  userId: string,
-) {
-  const { error } = await db
-    .from("user_profiles")
-    .upsert(
-      { user_id: userId },
-      { onConflict: "user_id", ignoreDuplicates: true },
-    );
-  return error;
+async function ensureProfileRow(userId: string) {
+  await prisma.userProfile.upsert({
+    where: { userId },
+    create: { userId },
+    update: {},
+  });
 }
 
 async function loadProfile(
-  db: ReturnType<typeof createServerSupabase>,
   userId: string,
   options: { repairMissing?: boolean } = {},
 ) {
-  let { data, error } = await db
-    .from("user_profiles")
-    .select(
-      "display_name, organisation, message_credits_used, credits_reset_date, tier, tabular_model",
-    )
-    .eq("user_id", userId)
-    .maybeSingle();
+  let profile = await prisma.userProfile.findUnique({
+    where: { userId },
+    select: {
+      displayName: true,
+      organisation: true,
+      messageCreditsUsed: true,
+      creditsResetDate: true,
+      tier: true,
+      tabularModel: true,
+    },
+  });
 
-  if (error) return { data: null, error };
-  if (!data) {
+  if (!profile) {
     if (!options.repairMissing) {
-      return { data: null, error: new Error("Profile not found") };
+      throw new Error("Profile not found");
     }
-
-    const ensureError = await ensureProfileRow(db, userId);
-    if (ensureError) return { data: null, error: ensureError };
-
-    const created = await db
-      .from("user_profiles")
-      .select(
-        "display_name, organisation, message_credits_used, credits_reset_date, tier, tabular_model",
-      )
-      .eq("user_id", userId)
-      .single();
-    if (created.error) return { data: null, error: created.error };
-    data = created.data;
+    await ensureProfileRow(userId);
+    profile = await prisma.userProfile.findUniqueOrThrow({
+      where: { userId },
+      select: {
+        displayName: true,
+        organisation: true,
+        messageCreditsUsed: true,
+        creditsResetDate: true,
+        tier: true,
+        tabularModel: true,
+      },
+    });
   }
 
-  let row = data as UserProfileRow;
-  if (row.credits_reset_date && new Date() > new Date(row.credits_reset_date)) {
+  if (profile.creditsResetDate && new Date() > new Date(profile.creditsResetDate)) {
     const creditsResetDate = new Date();
     creditsResetDate.setDate(creditsResetDate.getDate() + 30);
-    const { data: resetData, error: resetError } = await db
-      .from("user_profiles")
-      .update({
-        message_credits_used: 0,
-        credits_reset_date: creditsResetDate.toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq("user_id", userId)
-      .select(
-        "display_name, organisation, message_credits_used, credits_reset_date, tier, tabular_model",
-      )
-      .single();
-
-    if (resetError) return { data: null, error: resetError };
-    row = resetData as UserProfileRow;
+    profile = await prisma.userProfile.update({
+      where: { userId },
+      data: {
+        messageCreditsUsed: 0,
+        creditsResetDate,
+      },
+      select: {
+        displayName: true,
+        organisation: true,
+        messageCreditsUsed: true,
+        creditsResetDate: true,
+        tier: true,
+        tabularModel: true,
+      },
+    });
   }
 
-  return { data: serializeProfile(row), error: null };
+  return serializeProfile(profile as UserProfileRow);
 }
 
 // POST /user/profile
 userRouter.post("/profile", requireAuth, async (_req, res) => {
   const userId = res.locals.userId as string;
-  const db = createServerSupabase();
-  const error = await ensureProfileRow(db, userId);
-  if (error) return void res.status(500).json({ detail: error.message });
+  await ensureProfileRow(userId);
   res.json({ ok: true });
 });
 
 // GET /user/profile
 userRouter.get("/profile", requireAuth, async (_req, res) => {
   const userId = res.locals.userId as string;
-  const db = createServerSupabase();
-  const { data, error } = await loadProfile(db, userId, {
-    repairMissing: true,
-  });
-  if (error) return void res.status(500).json({ detail: error.message });
-  const apiKeyStatus = await getUserApiKeyStatus(userId, db);
+  const data = await loadProfile(userId, { repairMissing: true });
+  const apiKeyStatus = await getUserApiKeyStatus(userId);
   res.json({ ...data, apiKeyStatus });
 });
 
@@ -199,29 +188,30 @@ userRouter.patch("/profile", requireAuth, async (req, res) => {
   const parsed = validateProfilePayload(req.body);
   if (!parsed.ok) return void res.status(400).json({ detail: parsed.detail });
 
-  const db = createServerSupabase();
-  const ensureError = await ensureProfileRow(db, userId);
-  if (ensureError)
-    return void res.status(500).json({ detail: ensureError.message });
+  await ensureProfileRow(userId);
 
-  const { error: updateError } = await db
-    .from("user_profiles")
-    .update(parsed.update)
-    .eq("user_id", userId);
-  if (updateError)
-    return void res.status(500).json({ detail: updateError.message });
+  await prisma.userProfile.update({
+    where: { userId },
+    data: parsed.update,
+  });
 
-  const { data, error } = await loadProfile(db, userId);
-  if (error) return void res.status(500).json({ detail: error.message });
-  const apiKeyStatus = await getUserApiKeyStatus(userId, db);
+  await auditLog({
+    userId,
+    action: "update",
+    entity: "userProfile",
+    entityId: userId,
+    changes: parsed.update,
+  });
+
+  const data = await loadProfile(userId);
+  const apiKeyStatus = await getUserApiKeyStatus(userId);
   res.json({ ...data, apiKeyStatus });
 });
 
 // GET /user/api-keys
 userRouter.get("/api-keys", requireAuth, async (_req, res) => {
   const userId = res.locals.userId as string;
-  const db = createServerSupabase();
-  const status = await getUserApiKeyStatus(userId, db);
+  const status = await getUserApiKeyStatus(userId);
   res.json(status);
 });
 
@@ -234,7 +224,6 @@ userRouter.put("/api-keys/:provider", requireAuth, async (req, res) => {
 
   const apiKey =
     typeof req.body?.api_key === "string" ? req.body.api_key : null;
-  const db = createServerSupabase();
   try {
     if (hasEnvApiKey(provider)) {
       return void res.status(409).json({
@@ -242,8 +231,8 @@ userRouter.put("/api-keys/:provider", requireAuth, async (req, res) => {
           "This provider is configured by the server environment and cannot be changed from the browser.",
       });
     }
-    await saveUserApiKey(userId, provider, apiKey, db);
-    const status = await getUserApiKeyStatus(userId, db);
+    await saveUserApiKey(userId, provider, apiKey);
+    const status = await getUserApiKeyStatus(userId);
     res.json(status);
   } catch (err) {
     logger.error({ err, provider }, "[user/api-keys] save failed");
@@ -254,8 +243,16 @@ userRouter.put("/api-keys/:provider", requireAuth, async (req, res) => {
 // DELETE /user/account
 userRouter.delete("/account", requireAuth, async (_req, res) => {
   const userId = res.locals.userId as string;
-  const db = createServerSupabase();
-  const { error } = await db.auth.admin.deleteUser(userId);
+  // Auth user deletion still uses Supabase admin API
+  const supabaseUrl = process.env.SUPABASE_URL ?? "";
+  const serviceKey = process.env.SUPABASE_SECRET_KEY ?? "";
+  if (!supabaseUrl || !serviceKey) {
+    return void res.status(500).json({ detail: "Server auth is not configured" });
+  }
+  const admin = createClient(supabaseUrl, serviceKey, {
+    auth: { persistSession: false },
+  });
+  const { error } = await admin.auth.admin.deleteUser(userId);
   if (error) return void res.status(500).json({ detail: error.message });
   res.status(204).send();
 });

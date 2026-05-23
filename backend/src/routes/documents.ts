@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth";
-import { createServerSupabase } from "../lib/supabase";
+import { prisma } from "../lib/prisma";
 import { logger } from "../lib/logger";
 import {
   buildContentDisposition,
@@ -24,6 +24,7 @@ import {
 } from "../lib/documentVersions";
 import { ensureDocAccess } from "../lib/access";
 import { singleFileUpload } from "../lib/upload";
+import { auditLog } from "../lib/audit";
 
 export const documentsRouter = Router();
 const ALLOWED_TYPES = new Set(["pdf", "docx", "doc"]);
@@ -31,21 +32,17 @@ const ALLOWED_TYPES = new Set(["pdf", "docx", "doc"]);
 // GET /single-documents
 documentsRouter.get("/", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
-  const db = createServerSupabase();
-  const { data, error } = await db
-    .from("documents")
-    .select("*")
-    .eq("user_id", userId)
-    .is("project_id", null)
-    .order("created_at", { ascending: false });
-  if (error) return void res.status(500).json({ detail: error.message });
-  const docs = (data ?? []) as unknown as {
+  const docs = await prisma.document.findMany({
+    where: { userId, projectId: null },
+    orderBy: { createdAt: "desc" },
+  });
+  const docsTyped = docs as unknown as {
     id: string;
     current_version_id?: string | null;
   }[];
-  await attachLatestVersionNumbers(db, docs);
-  await attachActiveVersionPaths(db, docs);
-  res.json(docs);
+  await attachLatestVersionNumbers(docsTyped);
+  await attachActiveVersionPaths(docsTyped);
+  res.json(docsTyped);
 });
 
 // POST /single-documents
@@ -55,8 +52,7 @@ documentsRouter.post(
   singleFileUpload("file"),
   async (req, res) => {
     const userId = res.locals.userId as string;
-    const db = createServerSupabase();
-    await handleDocumentUpload(req, res, userId, null, db);
+    await handleDocumentUpload(req, res, userId, null);
   },
 );
 
@@ -64,61 +60,62 @@ documentsRouter.post(
 documentsRouter.delete("/:documentId", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
   const { documentId } = req.params;
-  const db = createServerSupabase();
 
-  const { data: doc, error } = await db
-    .from("documents")
-    .select("id")
-    .eq("id", documentId)
-    .eq("user_id", userId)
-    .single();
-  if (error || !doc)
+  const doc = await prisma.document.findFirst({
+    where: { id: documentId, userId },
+    select: { id: true },
+  });
+  if (!doc)
     return void res.status(404).json({ detail: "Document not found" });
 
   // Storage now lives on document_versions — fan out and delete each
   // version's bytes (DOCX + PDF rendition) before dropping rows.
-  const { data: versions } = await db
-    .from("document_versions")
-    .select("storage_path, pdf_storage_path")
-    .eq("document_id", documentId);
+  const versions = await prisma.documentVersion.findMany({
+    where: { documentId },
+    select: { storagePath: true, pdfStoragePath: true },
+  });
   await Promise.all(
-    (versions ?? []).flatMap((v) =>
-      [v.storage_path, v.pdf_storage_path]
+    versions.flatMap((v) =>
+      [v.storagePath, v.pdfStoragePath]
         .filter((p): p is string => typeof p === "string" && p.length > 0)
         .map((p) => deleteFile(p).catch(() => {})),
     ),
   );
-  await db.from("documents").delete().eq("id", documentId);
+  await prisma.document.delete({ where: { id: documentId } });
+
+  await auditLog({
+    userId,
+    action: "delete",
+    entity: "document",
+    entityId: documentId,
+  });
+
   res.status(204).send();
 });
 
 // GET /single-documents/:documentId/display
-// Optional ?version_id= renders a historical version. Defaults to the
-// document's current_version_id.
 documentsRouter.get("/:documentId/display", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
   const userEmail = res.locals.userEmail as string;
   const { documentId } = req.params;
   const versionIdParam =
     typeof req.query.version_id === "string" ? req.query.version_id : null;
-  const db = createServerSupabase();
 
-  const { data: doc } = await db
-    .from("documents")
-    .select("id, filename, file_type, user_id, project_id")
-    .eq("id", documentId)
-    .single();
+  const doc = await prisma.document.findUnique({
+    where: { id: documentId },
+    select: { id: true, filename: true, fileType: true, userId: true, projectId: true },
+  });
   if (!doc)
     return void res.status(404).json({ detail: "Document not found" });
-  const access = await ensureDocAccess(doc, userId, userEmail, db);
+  const access = await ensureDocAccess(doc, userId, userEmail);
   if (!access.ok)
     return void res.status(404).json({ detail: "Document not found" });
 
-  const active = await loadActiveVersion(documentId, db, versionIdParam);
+  const active = await loadActiveVersion(documentId, versionIdParam);
   if (!active)
     return void res.status(404).json({ detail: "No file available" });
 
-  const fileType = (doc.file_type as string) ?? "";
+  const fileType = doc.fileType ?? "";
   const isDocx = fileType === "docx" || fileType === "doc";
 
   // For DOCX, prefer the per-version PDF rendition if one exists.
@@ -136,18 +133,17 @@ documentsRouter.get("/:documentId/display", requireAuth, async (req, res) => {
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader(
       "Content-Disposition",
-      buildContentDisposition("inline", doc.filename as string),
+      buildContentDisposition("inline", doc.filename),
     );
     res.send(Buffer.from(raw));
   } else {
-    // Fallback: serve raw DOCX (mammoth will handle it client-side)
     res.setHeader(
       "Content-Type",
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     );
     res.setHeader(
       "Content-Disposition",
-      buildContentDisposition("inline", doc.filename as string),
+      buildContentDisposition("inline", doc.filename),
     );
     res.send(Buffer.from(raw));
   }
@@ -162,29 +158,22 @@ documentsRouter.post("/download-zip", requireAuth, async (req, res) => {
   if (!Array.isArray(document_ids) || document_ids.length === 0)
     return void res.status(400).json({ detail: "document_ids is required" });
 
-  const db = createServerSupabase();
-  const { data: rawDocs, error } = await db
-    .from("documents")
-    .select("id, filename, file_type, current_version_id, user_id, project_id")
-    .in("id", document_ids);
+  const rawDocs = await prisma.document.findMany({
+    where: { id: { in: document_ids } },
+    select: { id: true, filename: true, fileType: true, currentVersionId: true, userId: true, projectId: true },
+  });
 
-  if (error) return void res.status(500).json({ detail: error.message });
   // Filter to docs the user actually has access to (own + shared-project).
   const accessChecks = await Promise.all(
-    (rawDocs ?? []).map(async (d) => ({
+    rawDocs.map(async (d) => ({
       doc: d,
-      access: await ensureDocAccess(
-        d as { user_id: string; project_id: string | null },
-        userId,
-        userEmail,
-        db,
-      ),
+      access: await ensureDocAccess(d, userId, userEmail),
     })),
   );
   const docs = accessChecks
     .filter((x) => x.access.ok)
-    .map((x) => x.doc as { id: string; filename: string });
-  if (!docs || docs.length === 0)
+    .map((x) => x.doc);
+  if (docs.length === 0)
     return void res.status(404).json({ detail: "No documents found" });
 
   const JSZip = (await import("jszip")).default;
@@ -192,7 +181,7 @@ documentsRouter.post("/download-zip", requireAuth, async (req, res) => {
 
   await Promise.all(
     docs.map(async (doc) => {
-      const active = await loadActiveVersion(doc.id, db);
+      const active = await loadActiveVersion(doc.id);
       if (!active) return;
       const raw = await downloadFile(active.storage_path);
       if (!raw) return;
@@ -207,32 +196,28 @@ documentsRouter.post("/download-zip", requireAuth, async (req, res) => {
 });
 
 // GET /single-documents/:documentId/url
-// Optional ?version_id= selects a specific tracked-changes version.
-// Otherwise falls back to documents.current_version_id, else the original upload.
 documentsRouter.get("/:documentId/url", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
   const userEmail = res.locals.userEmail as string | undefined;
   const { documentId } = req.params;
   const versionIdParam = typeof req.query.version_id === "string" ? req.query.version_id : null;
-  const db = createServerSupabase();
 
-  const { data: doc, error } = await db
-    .from("documents")
-    .select("id, filename, user_id, project_id")
-    .eq("id", documentId)
-    .single();
-  if (error || !doc)
+  const doc = await prisma.document.findUnique({
+    where: { id: documentId },
+    select: { id: true, filename: true, userId: true, projectId: true },
+  });
+  if (!doc)
     return void res.status(404).json({ detail: "Document not found" });
-  const access = await ensureDocAccess(doc, userId, userEmail, db);
+  const access = await ensureDocAccess(doc, userId, userEmail);
   if (!access.ok)
     return void res.status(404).json({ detail: "Document not found" });
 
-  const active = await loadActiveVersion(documentId, db, versionIdParam);
+  const active = await loadActiveVersion(documentId, versionIdParam);
   if (!active)
     return void res.status(404).json({ detail: "No file available" });
 
   const downloadFilename = resolveDownloadFilename(
-    doc.filename as string,
+    doc.filename,
     active.display_name,
     active.version_number,
   );
@@ -249,36 +234,28 @@ documentsRouter.get("/:documentId/url", requireAuth, async (req, res) => {
     document_id: documentId,
     filename: downloadFilename,
     version_id: active.id,
-    // Lets the frontend decide between DocView (PDF.js) and DocxView
-    // (docx-preview) without a follow-up round-trip.
     has_pdf_rendition: !!active.pdf_storage_path,
   });
 });
 
 // GET /single-documents/:documentId/docx
-// Streams the raw .docx bytes for the given document, optionally at a
-// specific tracked-changes version. Unlike /url, this bypasses R2 (avoids
-// the browser CORS problem on signed URLs) so the frontend docx-preview
-// viewer can load tracked-change documents directly.
 documentsRouter.get("/:documentId/docx", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
   const userEmail = res.locals.userEmail as string | undefined;
   const { documentId } = req.params;
   const versionIdParam = typeof req.query.version_id === "string" ? req.query.version_id : null;
-  const db = createServerSupabase();
 
-  const { data: doc, error } = await db
-    .from("documents")
-    .select("id, filename, user_id, project_id")
-    .eq("id", documentId)
-    .single();
-  if (error || !doc)
+  const doc = await prisma.document.findUnique({
+    where: { id: documentId },
+    select: { id: true, filename: true, userId: true, projectId: true },
+  });
+  if (!doc)
     return void res.status(404).json({ detail: "Document not found" });
-  const access = await ensureDocAccess(doc, userId, userEmail, db);
+  const access = await ensureDocAccess(doc, userId, userEmail);
   if (!access.ok)
     return void res.status(404).json({ detail: "Document not found" });
 
-  const active = await loadActiveVersion(documentId, db, versionIdParam);
+  const active = await loadActiveVersion(documentId, versionIdParam);
   if (!active)
     return void res.status(404).json({ detail: "No file available" });
 
@@ -295,7 +272,7 @@ documentsRouter.get("/:documentId/docx", requireAuth, async (req, res) => {
     buildContentDisposition(
       "inline",
       resolveDownloadFilename(
-        doc.filename as string,
+        doc.filename,
         active.display_name,
         active.version_number,
       ),
@@ -304,9 +281,6 @@ documentsRouter.get("/:documentId/docx", requireAuth, async (req, res) => {
   res.send(Buffer.from(raw));
 });
 
-// Compose a download-friendly filename that carries the edit version
-// marker: "Purchase Agreement.docx" → "Purchase Agreement [Edited V2].docx".
-// Preserves the original extension (fallback: .docx).
 function versionedFilename(filename: string, version: number | null): string {
   if (!version || version < 1) return filename;
   const dot = filename.lastIndexOf(".");
@@ -315,10 +289,6 @@ function versionedFilename(filename: string, version: number | null): string {
   return `${stem} [Edited V${version}]${ext}`;
 }
 
-// Produce the filename a download should present to the user for a given
-// (document, version) pair. Prefers the version's display_name (appending
-// the original extension if the user didn't include one), falling back to
-// the versionedFilename heuristic.
 function resolveDownloadFilename(
   originalFilename: string,
   displayName: string | null | undefined,
@@ -342,41 +312,34 @@ function resolveDownloadFilename(
 }
 
 // GET /single-documents/:documentId/versions
-// Returns every version row for the document in document order, with
-// the human-friendly version number when present.
 documentsRouter.get("/:documentId/versions", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
   const userEmail = res.locals.userEmail as string | undefined;
   const { documentId } = req.params;
-  const db = createServerSupabase();
 
-  const { data: doc } = await db
-    .from("documents")
-    .select("id, current_version_id, user_id, project_id")
-    .eq("id", documentId)
-    .single();
+  const doc = await prisma.document.findUnique({
+    where: { id: documentId },
+    select: { id: true, currentVersionId: true, userId: true, projectId: true },
+  });
   if (!doc)
     return void res.status(404).json({ detail: "Document not found" });
-  const access = await ensureDocAccess(doc, userId, userEmail, db);
+  const access = await ensureDocAccess(doc, userId, userEmail);
   if (!access.ok)
     return void res.status(404).json({ detail: "Document not found" });
 
-  const { data: rows } = await db
-    .from("document_versions")
-    .select("id, version_number, source, created_at, display_name")
-    .eq("document_id", documentId)
-    .order("created_at", { ascending: true });
+  const rows = await prisma.documentVersion.findMany({
+    where: { documentId },
+    select: { id: true, versionNumber: true, source: true, createdAt: true, displayName: true },
+    orderBy: { createdAt: "asc" },
+  });
 
   res.json({
-    current_version_id: doc.current_version_id,
-    versions: rows ?? [],
+    current_version_id: doc.currentVersionId,
+    versions: rows,
   });
 });
 
 // POST /single-documents/:documentId/versions
-// Upload a brand-new version of an existing document. The uploaded file
-// becomes the new current_version_id. display_name defaults to the
-// uploaded filename; client may override via the `display_name` form field.
 documentsRouter.post(
   "/:documentId/versions",
   requireAuth,
@@ -385,36 +348,30 @@ documentsRouter.post(
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
     const { documentId } = req.params;
-    const db = createServerSupabase();
 
     const file = req.file;
     if (!file)
       return void res.status(400).json({ detail: "file is required" });
 
-    const { data: doc } = await db
-      .from("documents")
-      .select("id, filename, file_type, user_id, project_id")
-      .eq("id", documentId)
-      .single();
+    const doc = await prisma.document.findUnique({
+      where: { id: documentId },
+      select: { id: true, filename: true, fileType: true, userId: true, projectId: true },
+    });
     if (!doc)
       return void res.status(404).json({ detail: "Document not found" });
-    const access = await ensureDocAccess(doc, userId, userEmail, db);
+    const access = await ensureDocAccess(doc, userId, userEmail);
     if (!access.ok)
       return void res.status(404).json({ detail: "Document not found" });
 
-    // Reject if the uploaded file's extension doesn't match the document's
-    // declared type — otherwise every downstream viewer/extractor breaks.
     const suffix = file.originalname.includes(".")
       ? file.originalname.split(".").pop()!.toLowerCase()
       : "";
-    if (doc.file_type && suffix && doc.file_type !== suffix) {
+    if (doc.fileType && suffix && doc.fileType !== suffix) {
       return void res.status(400).json({
-        detail: `Uploaded file type (${suffix}) does not match document type (${doc.file_type}).`,
+        detail: `Uploaded file type (${suffix}) does not match document type (${doc.fileType}).`,
       });
     }
 
-    // Peg the new version into a predictable /versions/:id path under the
-    // existing document folder so ops can spot the history in storage.
     const versionSlug = crypto.randomUUID().replace(/-/g, "");
     const key = versionStorageKey(
       userId,
@@ -442,9 +399,6 @@ documentsRouter.post(
         .json({ detail: "Failed to upload new version." });
     }
 
-    // Render this version's bytes to PDF up front so /display can show
-    // historical versions without on-demand conversion. Same logic as the
-    // initial-upload pipeline; failures don't block the version row.
     let pdfStoragePath: string | null = null;
     if (suffix === "docx" || suffix === "doc") {
       try {
@@ -463,22 +417,20 @@ documentsRouter.post(
         logger.error({ err, filename: file.originalname }, "[versions/upload] DOCX→PDF conversion failed");
       }
     } else if (suffix === "pdf") {
-      // For PDF uploads, the uploaded bytes are themselves the PDF rendition.
       pdfStoragePath = key;
     }
 
-    // Per-document sequential version_number — the upload is V1 and
-    // user_upload + assistant_edit count forward from there.
-    const { data: maxRow } = await db
-      .from("document_versions")
-      .select("version_number")
-      .eq("document_id", documentId)
-      .in("source", ["upload", "user_upload", "assistant_edit"])
-      .order("version_number", { ascending: false, nullsFirst: false })
-      .limit(1)
-      .maybeSingle();
+    // Per-document sequential version_number
+    const maxRow = await prisma.documentVersion.findFirst({
+      where: {
+        documentId,
+        source: { in: ["upload", "user_upload", "assistant_edit"] },
+      },
+      orderBy: { versionNumber: "desc" },
+      select: { versionNumber: true },
+    });
     const nextVersionNumber =
-      ((maxRow?.version_number as number | null) ?? 1) + 1;
+      ((maxRow?.versionNumber as number | null) ?? 1) + 1;
 
     const defaultDisplayName =
       typeof req.body?.display_name === "string" &&
@@ -486,31 +438,21 @@ documentsRouter.post(
         ? req.body.display_name.trim().slice(0, 200)
         : file.originalname;
 
-    const { data: versionRow, error: verErr } = await db
-      .from("document_versions")
-      .insert({
-        document_id: documentId,
-        storage_path: key,
-        pdf_storage_path: pdfStoragePath,
+    const versionRow = await prisma.documentVersion.create({
+      data: {
+        documentId,
+        storagePath: key,
+        pdfStoragePath,
         source: "user_upload",
-        version_number: nextVersionNumber,
-        display_name: defaultDisplayName,
-      })
-      .select("id, version_number, source, created_at, display_name")
-      .single();
-    if (verErr || !versionRow) {
-      logger.error({ err: verErr }, "[versions/upload] insert failed");
-      return void res
-        .status(500)
-        .json({ detail: "Failed to record new version." });
-    }
+        versionNumber: nextVersionNumber,
+        displayName: defaultDisplayName,
+      },
+      select: { id: true, versionNumber: true, source: true, createdAt: true, displayName: true },
+    });
 
-    // Also propagate the user-provided display_name to the parent document's
-    // filename so the document's display name stays in sync across the UI.
-    // Preserve a sensible extension: if the display_name has none, append
-    // the uploaded file's extension (fallback: the existing doc's extension).
+    // Propagate display_name to parent doc's filename
     const documentsUpdate: Record<string, unknown> = {
-      current_version_id: versionRow.id,
+      currentVersionId: versionRow.id,
     };
     const providedDisplayName =
       typeof req.body?.display_name === "string" &&
@@ -519,25 +461,23 @@ documentsRouter.post(
         : null;
     if (providedDisplayName) {
       const hasExt = /\.[a-z0-9]{1,6}$/i.test(providedDisplayName);
-      const existingExt = (doc.filename as string | null)?.match(
+      const existingExt = doc.filename?.match(
         /\.[a-z0-9]{1,6}$/i,
       )?.[0];
       const uploadedExt = suffix ? `.${suffix}` : "";
       const ext = hasExt ? "" : uploadedExt || existingExt || "";
       documentsUpdate.filename = `${providedDisplayName}${ext}`;
     }
-    await db
-      .from("documents")
-      .update(documentsUpdate)
-      .eq("id", documentId);
+    await prisma.document.update({
+      where: { id: documentId },
+      data: documentsUpdate,
+    });
 
     res.status(201).json(versionRow);
   },
 );
 
 // PATCH /single-documents/:documentId/versions/:versionId
-// Rename a version's display_name. Pass `{ "display_name": "…" }`; an empty
-// or missing value clears the override so the UI falls back to V{n}.
 documentsRouter.patch(
   "/:documentId/versions/:versionId",
   requireAuth,
@@ -545,16 +485,14 @@ documentsRouter.patch(
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
     const { documentId, versionId } = req.params;
-    const db = createServerSupabase();
 
-    const { data: doc } = await db
-      .from("documents")
-      .select("id, user_id, project_id")
-      .eq("id", documentId)
-      .single();
+    const doc = await prisma.document.findUnique({
+      where: { id: documentId },
+      select: { id: true, userId: true, projectId: true },
+    });
     if (!doc)
       return void res.status(404).json({ detail: "Document not found" });
-    const access = await ensureDocAccess(doc, userId, userEmail, db);
+    const access = await ensureDocAccess(doc, userId, userEmail);
     if (!access.ok)
       return void res.status(404).json({ detail: "Document not found" });
 
@@ -562,25 +500,23 @@ documentsRouter.patch(
     const displayName =
       typeof raw === "string" && raw.trim() ? raw.trim().slice(0, 200) : null;
 
-    const { data: updated, error } = await db
-      .from("document_versions")
-      .update({ display_name: displayName })
-      .eq("id", versionId)
-      .eq("document_id", documentId)
-      .select("id, version_number, source, created_at, display_name")
-      .single();
-    if (error || !updated) {
+    const existing = await prisma.documentVersion.findFirst({
+      where: { id: versionId, documentId },
+    });
+    if (!existing) {
       return void res.status(404).json({ detail: "Version not found" });
     }
+
+    const updated = await prisma.documentVersion.update({
+      where: { id: versionId },
+      data: { displayName },
+      select: { id: true, versionNumber: true, source: true, createdAt: true, displayName: true },
+    });
     res.json(updated);
   },
 );
 
 // GET /single-documents/:documentId/tracked-change-ids
-// Returns the ordered list of { kind, w_id } for every w:ins / w:del in
-// the current (or specified) version's document.xml. The frontend uses
-// this to tag each rendered <ins>/<del> with data-w-id, since
-// docx-preview drops the w:id attribute during parsing.
 documentsRouter.get(
   "/:documentId/tracked-change-ids",
   requireAuth,
@@ -590,30 +526,28 @@ documentsRouter.get(
     const { documentId } = req.params;
     const versionIdParam =
       typeof req.query.version_id === "string" ? req.query.version_id : null;
-    const db = createServerSupabase();
 
-    const { data: doc } = await db
-      .from("documents")
-      .select("id, user_id, project_id")
-      .eq("id", documentId)
-      .single();
+    const doc = await prisma.document.findUnique({
+      where: { id: documentId },
+      select: { id: true, userId: true, projectId: true },
+    });
     if (!doc)
       return void res.status(404).json({ detail: "Document not found" });
-    const access = await ensureDocAccess(doc, userId, userEmail, db);
+    const access = await ensureDocAccess(doc, userId, userEmail);
     if (!access.ok)
       return void res.status(404).json({ detail: "Document not found" });
 
-    const active = await loadActiveVersion(documentId, db, versionIdParam);
+    const active = await loadActiveVersion(documentId, versionIdParam);
     if (!active)
       return void res.status(404).json({ detail: "No file available" });
 
-    const raw = await downloadFile(active.storage_path);
-    if (!raw)
+    const rawBytes = await downloadFile(active.storage_path);
+    if (!rawBytes)
       return void res
         .status(404)
         .json({ detail: "Document bytes not available" });
 
-    const ids = await extractTrackedChangeIds(Buffer.from(raw));
+    const ids = await extractTrackedChangeIds(Buffer.from(rawBytes));
     res.json({ ids });
   },
 );
@@ -628,166 +562,137 @@ async function handleEditResolution(
   const userId = res.locals.userId as string;
   const userEmail = res.locals.userEmail as string | undefined;
   const { documentId, editId } = req.params;
-  const db = createServerSupabase();
 
   logger.info({ mode, userId, documentId, editId }, "[edit-resolution] incoming");
 
-  const { data: edit, error: editErr } = await db
-    .from("document_edits")
-    .select("id, document_id, change_id, del_w_id, ins_w_id, status")
-    .eq("id", editId)
-    .eq("document_id", documentId)
-    .single();
-  logger.info({ edit, editErr }, "[edit-resolution] fetched edit row");
+  const edit = await prisma.documentEdit.findFirst({
+    where: { id: editId, documentId },
+    select: { id: true, documentId: true, changeId: true, delWId: true, insWId: true, status: true },
+  });
+  logger.info({ edit }, "[edit-resolution] fetched edit row");
   if (!edit) {
     logger.info(`[edit-resolution] edit not found, returning 404`);
     return void res.status(404).json({ detail: "Edit not found" });
   }
-  // Idempotent: if the edit is already resolved, return the current doc
-  // state so stale UI (e.g. an old chat reloaded in a new session) can
-  // reconcile without throwing.
+  // Idempotent: if the edit is already resolved, return the current doc state
   if (edit.status !== "pending") {
     logger.info({ editId, status: edit.status }, "[edit-resolution] edit already resolved");
-    const { data: doc } = await db
-      .from("documents")
-      .select("current_version_id, filename, user_id, project_id")
-      .eq("id", documentId)
-      .single();
+    const doc = await prisma.document.findUnique({
+      where: { id: documentId },
+      select: { currentVersionId: true, filename: true, userId: true, projectId: true },
+    });
     if (!doc) {
-      logger.info(`[edit-resolution] doc not found for resolved edit`);
       return void res.status(404).json({ detail: "Document not found" });
     }
-    const accessResolved = await ensureDocAccess(doc, userId, userEmail, db);
+    const accessResolved = await ensureDocAccess(doc, userId, userEmail);
     if (!accessResolved.ok) {
-      logger.info(`[edit-resolution] doc access denied for resolved edit`);
       return void res.status(404).json({ detail: "Document not found" });
     }
-    const activeForResolved = await loadActiveVersion(documentId, db);
+    const activeForResolved = await loadActiveVersion(documentId);
     const payload = {
       ok: true,
       already_resolved: true,
       status: edit.status,
-      version_id: doc.current_version_id ?? null,
+      version_id: doc.currentVersionId ?? null,
       download_url: activeForResolved
         ? buildDownloadUrl(
             activeForResolved.storage_path,
-            (doc.filename as string) ?? "document.docx",
+            doc.filename ?? "document.docx",
           )
         : null,
       remaining_pending: 0,
     };
-    logger.info({ payload }, "[edit-resolution] returning already-resolved payload");
     return void res.status(200).json(payload);
   }
 
-  const { data: doc, error: docErr } = await db
-    .from("documents")
-    .select("id, current_version_id, user_id, project_id")
-    .eq("id", documentId)
-    .single();
-  logger.info({ doc, docErr }, "[edit-resolution] fetched doc");
+  const doc = await prisma.document.findUnique({
+    where: { id: documentId },
+    select: { id: true, currentVersionId: true, userId: true, projectId: true },
+  });
   if (!doc)
     return void res.status(404).json({ detail: "Document not found" });
-  const access = await ensureDocAccess(doc, userId, userEmail, db);
+  const access = await ensureDocAccess(doc, userId, userEmail);
   if (!access.ok)
     return void res.status(404).json({ detail: "Document not found" });
 
-  const active = await loadActiveVersion(documentId, db);
+  const active = await loadActiveVersion(documentId);
   const latestPath = active?.storage_path ?? null;
-  logger.info({ latestPath, current_version_id: doc.current_version_id }, "[edit-resolution] resolved latestPath");
   if (!latestPath)
     return void res.status(404).json({ detail: "No file to edit" });
 
-  const raw = await downloadFile(latestPath);
-  logger.info({ byteLength: raw?.byteLength ?? 0 }, "[edit-resolution] downloaded bytes");
-  if (!raw)
+  const rawBytes = await downloadFile(latestPath);
+  if (!rawBytes)
     return void res.status(404).json({ detail: "Document bytes not available" });
 
-  const wIds = [edit.del_w_id, edit.ins_w_id].filter(
+  const wIds = [edit.delWId, edit.insWId].filter(
     (v): v is string => typeof v === "string" && v.length > 0,
   );
   const { bytes: resolvedBytes, found } = await resolveTrackedChange(
-    Buffer.from(raw),
+    Buffer.from(rawBytes),
     wIds,
     mode,
   );
-  logger.info({ mode, change_id: edit.change_id, wIds, found, resolvedByteLength: resolvedBytes?.byteLength ?? 0 }, "[edit-resolution] resolveTrackedChange result");
   if (!found) {
-    logger.info(
-      `[edit-resolution] change_id not found in docx — updating status only`,
-    );
-    // Still update DB status so the UI reflects the decision — the change
-    // may have been auto-consumed by a previous accept/reject pass.
-    const { error: updErr } = await db
-      .from("document_edits")
-      .update({ status: mode === "accept" ? "accepted" : "rejected", resolved_at: new Date().toISOString() })
-      .eq("id", editId);
-    logger.info({ updErr }, "[edit-resolution] status-only update");
-    const { data: filenameRow } = await db
-      .from("documents")
-      .select("filename")
-      .eq("id", documentId)
-      .single();
+    // Still update DB status so the UI reflects the decision
+    await prisma.documentEdit.update({
+      where: { id: editId },
+      data: {
+        status: mode === "accept" ? "accepted" : "rejected",
+        resolvedAt: new Date(),
+      },
+    });
+    const filenameRow = await prisma.document.findUnique({
+      where: { id: documentId },
+      select: { filename: true },
+    });
     const payload = {
       ok: true,
-      version_id: doc.current_version_id,
+      version_id: doc.currentVersionId,
       download_url: buildDownloadUrl(
         latestPath,
-        (filenameRow?.filename as string) ?? "document.docx",
+        filenameRow?.filename ?? "document.docx",
       ),
       remaining_pending: 0,
     };
-    logger.info({ payload }, "[edit-resolution] returning not-found payload");
     return void res.status(200).json(payload);
   }
 
-  // Overwrite bytes in place at the current version's storage path —
-  // accept/reject mutates the existing version rather than spawning a
-  // new row. This keeps document_versions lean (one row per assistant
-  // edit, not one per accept/reject click) and avoids the N-versions-
-  // per-doc churn as users resolve pending changes.
+  // Overwrite bytes in place at the current version's storage path
   const ab = resolvedBytes.buffer.slice(
     resolvedBytes.byteOffset,
     resolvedBytes.byteOffset + resolvedBytes.byteLength,
   ) as ArrayBuffer;
-  logger.info({ latestPath, byteLength: ab.byteLength }, "[edit-resolution] overwriting bytes in place");
   await uploadFile(
     latestPath,
     ab,
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   );
 
-  const { error: statusErr } = await db
-    .from("document_edits")
-    .update({
+  await prisma.documentEdit.update({
+    where: { id: editId },
+    data: {
       status: mode === "accept" ? "accepted" : "rejected",
-      resolved_at: new Date().toISOString(),
-    })
-    .eq("id", editId);
-  logger.info({ editId, newStatus: mode === "accept" ? "accepted" : "rejected", statusErr }, "[edit-resolution] updated document_edits status");
+      resolvedAt: new Date(),
+    },
+  });
 
-  const { count: remainingPending } = await db
-    .from("document_edits")
-    .select("id", { count: "exact", head: true })
-    .eq("document_id", documentId)
-    .eq("status", "pending");
-  logger.info({ remainingPending }, "[edit-resolution] remaining pending count");
+  const remainingPending = await prisma.documentEdit.count({
+    where: { documentId, status: "pending" },
+  });
 
-  const { data: filenameRow } = await db
-    .from("documents")
-    .select("filename")
-    .eq("id", documentId)
-    .single();
+  const filenameRow = await prisma.document.findUnique({
+    where: { id: documentId },
+    select: { filename: true },
+  });
   const payload = {
     ok: true,
-    version_id: doc.current_version_id,
+    version_id: doc.currentVersionId,
     download_url: buildDownloadUrl(
       latestPath,
-      (filenameRow?.filename as string) ?? "document.docx",
+      filenameRow?.filename ?? "document.docx",
     ),
-    remaining_pending: remainingPending ?? 0,
+    remaining_pending: remainingPending,
   };
-  logger.info({ payload }, "[edit-resolution] returning success payload");
   res.json(payload);
 }
 
@@ -808,7 +713,6 @@ async function handleDocumentUpload(
   res: import("express").Response,
   userId: string,
   projectId: string | null,
-  db: ReturnType<typeof createServerSupabase>,
 ) {
   const file = req.file;
   if (!file) return void res.status(400).json({ detail: "file is required" });
@@ -825,25 +729,19 @@ async function handleDocumentUpload(
       });
 
   const content = file.buffer;
-  const { data: doc, error: insertErr } = await db
-    .from("documents")
-    .insert({
-      project_id: projectId,
-      user_id: userId,
+  const doc = await prisma.document.create({
+    data: {
+      projectId,
+      userId,
       filename,
-      file_type: suffix,
-      size_bytes: content.byteLength,
+      fileType: suffix,
+      sizeBytes: content.byteLength,
       status: "processing",
-    })
-    .select("*")
-    .single();
-  if (insertErr || !doc)
-    return void res
-      .status(500)
-      .json({ detail: "Failed to create document record" });
+    },
+  });
 
   try {
-    const docId = doc.id as string;
+    const docId = doc.id;
     const key = storageKey(userId, docId, filename);
     const contentType =
       suffix === "pdf"
@@ -862,10 +760,9 @@ async function handleDocumentUpload(
       content.byteOffset,
       content.byteOffset + content.byteLength,
     ) as ArrayBuffer;
-    const tree = await extractStructureTree(rawBuf, suffix, filename);
+    const tree = await extractStructureTree(rawBuf, suffix);
     const pageCount = suffix === "pdf" ? await countPdfPages(rawBuf) : null;
 
-    // Convert DOCX/DOC → PDF for display. PDFs are their own rendition.
     let pdfStoragePath: string | null = null;
     if (suffix === "docx" || suffix === "doc") {
       try {
@@ -887,51 +784,41 @@ async function handleDocumentUpload(
       pdfStoragePath = key;
     }
 
-    // storage_path / pdf_storage_path live on document_versions now —
-    // create the V1 "upload" row and point documents.current_version_id
-    // at it.
-    const { data: versionRow, error: verErr } = await db
-      .from("document_versions")
-      .insert({
-        document_id: docId,
-        storage_path: key,
-        pdf_storage_path: pdfStoragePath,
+    const versionRow = await prisma.documentVersion.create({
+      data: {
+        documentId: docId,
+        storagePath: key,
+        pdfStoragePath,
         source: "upload",
-        version_number: 1,
-        display_name: filename,
-      })
-      .select("id")
-      .single();
-    if (verErr || !versionRow) {
-      throw new Error(
-        `Failed to record upload version: ${verErr?.message ?? "unknown"}`,
-      );
-    }
+        versionNumber: 1,
+        displayName: filename,
+      },
+      select: { id: true },
+    });
 
-    await db
-      .from("documents")
-      .update({
-        current_version_id: versionRow.id,
-        size_bytes: content.byteLength,
-        page_count: pageCount,
-        structure_tree: tree ?? null,
+    await prisma.document.update({
+      where: { id: docId },
+      data: {
+        currentVersionId: versionRow.id,
+        sizeBytes: content.byteLength,
+        pageCount,
+        structureTree: (tree as any) ?? undefined,
         status: "ready",
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", docId);
+      },
+    });
 
-    const { data: updated } = await db
-      .from("documents")
-      .select("*")
-      .eq("id", docId)
-      .single();
-    // Surface storage paths to the caller for backward compatibility.
+    const updated = await prisma.document.findUnique({
+      where: { id: docId },
+    });
     const responseDoc = updated
       ? { ...updated, storage_path: key, pdf_storage_path: pdfStoragePath }
       : updated;
     return void res.status(201).json(responseDoc);
   } catch (e) {
-    await db.from("documents").update({ status: "error" }).eq("id", doc.id);
+    await prisma.document.update({
+      where: { id: doc.id },
+      data: { status: "failed" as any },
+    });
     return void res
       .status(500)
       .json({ detail: `Document processing failed: ${String(e)}` });
@@ -957,7 +844,6 @@ async function countPdfPages(buf: ArrayBuffer): Promise<number | null> {
 async function extractStructureTree(
   content: ArrayBuffer,
   fileType: string,
-  _filename: string,
 ): Promise<unknown[] | null> {
   try {
     if (fileType === "pdf") {

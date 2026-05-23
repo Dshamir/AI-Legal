@@ -11,9 +11,7 @@
  * owner-only (delete, rename, member management).
  */
 
-import type { createServerSupabase } from "./supabase";
-
-type Db = ReturnType<typeof createServerSupabase>;
+import { prisma } from "./prisma";
 
 export type ProjectAccess =
     | {
@@ -21,8 +19,8 @@ export type ProjectAccess =
           isOwner: boolean;
           project: {
               id: string;
-              user_id: string;
-              shared_with: string[] | null;
+              userId: string;
+              sharedWith: string[] | null;
           };
       }
     | { ok: false };
@@ -31,29 +29,32 @@ export async function checkProjectAccess(
     projectId: string,
     userId: string,
     userEmail: string | null | undefined,
-    db: Db,
 ): Promise<ProjectAccess> {
-    const { data: project } = await db
-        .from("projects")
-        .select("id, user_id, shared_with")
-        .eq("id", projectId)
-        .single();
+    const project = await prisma.project.findUnique({
+        where: { id: projectId },
+        select: { id: true, userId: true, sharedWith: true },
+    });
     if (!project) return { ok: false };
-    const proj = project as {
-        id: string;
-        user_id: string;
-        shared_with: string[] | null;
-    };
-    if (proj.user_id === userId) {
-        return { ok: true, isOwner: true, project: proj };
+    const sharedWith = Array.isArray(project.sharedWith)
+        ? (project.sharedWith as string[])
+        : [];
+    if (project.userId === userId) {
+        return {
+            ok: true,
+            isOwner: true,
+            project: { id: project.id, userId: project.userId, sharedWith },
+        };
     }
-    const sharedWith = Array.isArray(proj.shared_with) ? proj.shared_with : [];
     const email = (userEmail ?? "").toLowerCase();
     if (
         email &&
         sharedWith.some((e) => (e ?? "").toLowerCase() === email)
     ) {
-        return { ok: true, isOwner: false, project: proj };
+        return {
+            ok: true,
+            isOwner: false,
+            project: { id: project.id, userId: project.userId, sharedWith },
+        };
     }
     return { ok: false };
 }
@@ -65,18 +66,16 @@ export async function checkProjectAccess(
  * project-membership check via `shared_with`.
  */
 export async function ensureDocAccess(
-    doc: { user_id: string; project_id: string | null },
+    doc: { userId: string; projectId: string | null },
     userId: string,
     userEmail: string | null | undefined,
-    db: Db,
 ): Promise<{ ok: true; isOwner: boolean } | { ok: false }> {
-    if (doc.user_id === userId) return { ok: true, isOwner: true };
-    if (!doc.project_id) return { ok: false };
+    if (doc.userId === userId) return { ok: true, isOwner: true };
+    if (!doc.projectId) return { ok: false };
     const access = await checkProjectAccess(
-        doc.project_id,
+        doc.projectId,
         userId,
         userEmail,
-        db,
     );
     if (access.ok) return { ok: true, isOwner: false };
     return { ok: false };
@@ -93,27 +92,26 @@ export async function ensureDocAccess(
  */
 export async function ensureReviewAccess(
     review: {
-        user_id: string;
-        project_id: string | null;
-        shared_with?: string[] | null;
+        userId: string;
+        projectId: string | null;
+        sharedWith?: unknown;
     },
     userId: string,
     userEmail: string | null | undefined,
-    db: Db,
 ): Promise<{ ok: true; isOwner: boolean } | { ok: false }> {
-    if (review.user_id === userId) return { ok: true, isOwner: true };
+    if (review.userId === userId) return { ok: true, isOwner: true };
     const email = (userEmail ?? "").toLowerCase();
-    if (email && Array.isArray(review.shared_with)) {
-        if (review.shared_with.some((e) => (e ?? "").toLowerCase() === email)) {
+    const sharedWith = Array.isArray(review.sharedWith) ? review.sharedWith as string[] : [];
+    if (email && sharedWith.length > 0) {
+        if (sharedWith.some((e) => (e ?? "").toLowerCase() === email)) {
             return { ok: true, isOwner: false };
         }
     }
-    if (!review.project_id) return { ok: false };
+    if (!review.projectId) return { ok: false };
     const access = await checkProjectAccess(
-        review.project_id,
+        review.projectId,
         userId,
         userEmail,
-        db,
     );
     if (access.ok) return { ok: true, isOwner: false };
     return { ok: false };
@@ -130,30 +128,24 @@ export async function filterAccessibleDocumentIds(
     documentIds: string[],
     userId: string,
     userEmail: string | null | undefined,
-    db: Db,
 ): Promise<string[]> {
     if (documentIds.length === 0) return [];
-    const { data: docs } = await db
-        .from("documents")
-        .select("id, user_id, project_id")
-        .in("id", documentIds);
-    const rows = (docs ?? []) as {
-        id: string;
-        user_id: string;
-        project_id: string | null;
-    }[];
-    if (rows.length === 0) return [];
+    const docs = await prisma.document.findMany({
+        where: { id: { in: documentIds } },
+        select: { id: true, userId: true, projectId: true },
+    });
+    if (docs.length === 0) return [];
 
     const accessibleProjectIds = new Set(
-        await listAccessibleProjectIds(userId, userEmail, db),
+        await listAccessibleProjectIds(userId, userEmail),
     );
     const allowed: string[] = [];
-    for (const doc of rows) {
-        if (doc.user_id === userId) {
+    for (const doc of docs) {
+        if (doc.userId === userId) {
             allowed.push(doc.id);
         } else if (
-            doc.project_id &&
-            accessibleProjectIds.has(doc.project_id)
+            doc.projectId &&
+            accessibleProjectIds.has(doc.projectId)
         ) {
             allowed.push(doc.id);
         }
@@ -169,20 +161,25 @@ export async function filterAccessibleDocumentIds(
 export async function listAccessibleProjectIds(
     userId: string,
     userEmail: string | null | undefined,
-    db: Db,
 ): Promise<string[]> {
-    const [{ data: own }, { data: shared }] = await Promise.all([
-        db.from("projects").select("id").eq("user_id", userId),
-        userEmail
-            ? db
-                  .from("projects")
-                  .select("id")
-                  .filter("shared_with", "cs", JSON.stringify([userEmail]))
-                  .neq("user_id", userId)
-            : Promise.resolve({ data: [] as { id: string }[] }),
-    ]);
+    const ownProjects = await prisma.project.findMany({
+        where: { userId },
+        select: { id: true },
+    });
+
+    let sharedProjects: { id: string }[] = [];
+    if (userEmail) {
+        sharedProjects = await prisma.project.findMany({
+            where: {
+                sharedWith: { path: [], array_contains: [userEmail] },
+                userId: { not: userId },
+            },
+            select: { id: true },
+        });
+    }
+
     const ids = new Set<string>();
-    for (const p of (own ?? []) as { id: string }[]) ids.add(p.id);
-    for (const p of (shared ?? []) as { id: string }[]) ids.add(p.id);
+    for (const p of ownProjects) ids.add(p.id);
+    for (const p of sharedProjects) ids.add(p.id);
     return [...ids];
 }

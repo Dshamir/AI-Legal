@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth";
-import { createServerSupabase } from "../lib/supabase";
+import { prisma } from "../lib/prisma";
 import {
     buildProjectDocContext,
     buildMessages,
@@ -39,14 +39,11 @@ projectChatRouter.post("/", requireAuth, async (req, res) => {
             attached_documents?: { filename: string; document_id: string }[];
         };
 
-    const db = createServerSupabase();
-
     // Verify the user has access to the project (owner or shared member).
     const projectAccess = await checkProjectAccess(
         projectId,
         userId,
         userEmail,
-        db,
     );
     if (!projectAccess.ok)
         return void res.status(404).json({ detail: "Project not found" });
@@ -55,45 +52,39 @@ projectChatRouter.post("/", requireAuth, async (req, res) => {
     let chatTitle: string | null = null;
 
     if (chatId) {
-        const { data: existing } = await db
-            .from("chats")
-            .select("id, title, project_id")
-            .eq("id", chatId)
-            .single();
-        const canUse = !!existing && existing.project_id === projectId;
+        const existing = await prisma.chat.findUnique({
+            where: { id: chatId },
+            select: { id: true, title: true, projectId: true },
+        });
+        const canUse = !!existing && existing.projectId === projectId;
         if (!canUse) chatId = null;
         else chatTitle = existing!.title;
     }
 
     if (!chatId) {
-        const { data: newChat, error } = await db
-            .from("chats")
-            .insert({ user_id: userId, project_id: projectId })
-            .select("id, title")
-            .single();
-        if (error || !newChat)
-            return void res
-                .status(500)
-                .json({ detail: "Failed to create chat" });
-        chatId = newChat.id as string;
+        const newChat = await prisma.chat.create({
+            data: { userId, projectId },
+            select: { id: true, title: true },
+        });
+        chatId = newChat.id;
         chatTitle = newChat.title;
     }
 
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
     if (lastUser) {
-        await db.from("chat_messages").insert({
-            chat_id: chatId,
-            role: "user",
-            content: lastUser.content,
-            files: lastUser.files ?? null,
-            workflow: lastUser.workflow ?? null,
+        await prisma.chatMessage.create({
+            data: {
+                chatId,
+                role: "user",
+                content: lastUser.content ?? undefined,
+                files: (lastUser.files as any) ?? undefined,
+            },
         });
     }
 
     const { docIndex, docStore, folderPaths } = await buildProjectDocContext(
         projectId,
         userId,
-        db,
     );
     const docAvailability = Object.entries(docIndex).map(([doc_id, info]) => ({
         doc_id,
@@ -104,7 +95,6 @@ projectChatRouter.post("/", requireAuth, async (req, res) => {
     const enrichedMessages = await enrichWithPriorEvents(
         messages,
         chatId,
-        db,
         docIndex,
     );
     const messagesForLLM: ChatMessage[] = displayed_doc
@@ -143,7 +133,7 @@ projectChatRouter.post("/", requireAuth, async (req, res) => {
         systemPromptExtra,
     );
 
-    const workflowStore = await buildWorkflowStore(userId, userEmail, db);
+    const workflowStore = await buildWorkflowStore(userId, userEmail);
 
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
@@ -153,7 +143,7 @@ projectChatRouter.post("/", requireAuth, async (req, res) => {
 
     const write = (line: string) => res.write(line);
 
-    const apiKeys = await getUserApiKeys(userId, db);
+    const apiKeys = await getUserApiKeys(userId);
 
     try {
         write(`data: ${JSON.stringify({ type: "chat_id", chatId })}\n\n`);
@@ -163,7 +153,6 @@ projectChatRouter.post("/", requireAuth, async (req, res) => {
             docStore,
             docIndex,
             userId,
-            db,
             write,
             extraTools: PROJECT_EXTRA_TOOLS,
             workflowStore,
@@ -173,18 +162,20 @@ projectChatRouter.post("/", requireAuth, async (req, res) => {
         });
 
         const annotations = extractAnnotations(fullText, docIndex, events);
-        await db.from("chat_messages").insert({
-            chat_id: chatId,
-            role: "assistant",
-            content: events.length ? events : null,
-            annotations: annotations.length ? annotations : null,
+        await prisma.chatMessage.create({
+            data: {
+                chatId,
+                role: "assistant",
+                content: events.length ? (events as any) : undefined,
+                annotations: annotations.length ? (annotations as any) : undefined,
+            },
         });
 
         if (!chatTitle && lastUser?.content) {
-            await db
-                .from("chats")
-                .update({ title: lastUser.content.slice(0, 120) })
-                .eq("id", chatId);
+            await prisma.chat.update({
+                where: { id: chatId },
+                data: { title: lastUser.content.slice(0, 120) },
+            });
         }
     } catch (err) {
         logger.error({ err }, "[project-chat/stream] error");

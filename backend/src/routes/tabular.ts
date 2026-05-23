@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth";
-import { createServerSupabase } from "../lib/supabase";
+import { prisma } from "../lib/prisma";
 import { logger } from "../lib/logger";
 import { downloadFile } from "../lib/storage";
 import { loadActiveVersion } from "../lib/documentVersions";
@@ -25,6 +25,8 @@ import {
     filterAccessibleDocumentIds,
     listAccessibleProjectIds,
 } from "../lib/access";
+import { auditLog } from "../lib/audit";
+import { createClient } from "@supabase/supabase-js";
 
 function formatPromptSuffix(format?: string, tags?: string[]): string {
     switch (format) {
@@ -69,94 +71,72 @@ function missingModelApiKey(model: string, apiKeys: UserApiKeys) {
     };
 }
 
+/** Helper to get Supabase admin client for auth-only operations */
+function getSupabaseAdmin() {
+  const supabaseUrl = process.env.SUPABASE_URL ?? "";
+  const serviceKey = process.env.SUPABASE_SECRET_KEY ?? "";
+  if (!supabaseUrl || !serviceKey) return null;
+  return createClient(supabaseUrl, serviceKey, {
+    auth: { persistSession: false },
+  });
+}
+
 // GET /tabular-review
 tabularRouter.get("/", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
-    const db = createServerSupabase();
 
-    // Optional ?project_id= scopes results to a single project. Project-page
-    // callers pass it; the global tabular-reviews page omits it. We still
-    // enforce access via listAccessibleProjectIds so a stranger can't request
-    // an arbitrary project_id.
     const projectIdFilter =
         typeof req.query.project_id === "string" && req.query.project_id
             ? (req.query.project_id as string)
             : null;
 
-    // Visible reviews = user's own + reviews in any accessible project.
-    const projectIds = await listAccessibleProjectIds(userId, userEmail, db);
+    const projectIds = await listAccessibleProjectIds(userId, userEmail);
 
     if (projectIdFilter && !projectIds.includes(projectIdFilter)) {
-        // No access to that project — also covers "project doesn't exist".
         return void res.json([]);
     }
 
-    let ownQuery = db
-        .from("tabular_reviews")
-        .select("*")
-        .eq("user_id", userId)
-        .order("created_at", { ascending: false });
-    if (projectIdFilter) ownQuery = ownQuery.eq("project_id", projectIdFilter);
+    // Own reviews
+    const ownWhere: Record<string, unknown> = { userId };
+    if (projectIdFilter) ownWhere.projectId = projectIdFilter;
+    const own = await prisma.tabularReview.findMany({
+        where: ownWhere,
+        orderBy: { createdAt: "desc" },
+    });
 
     const sharedProjectIds = projectIdFilter ? [projectIdFilter] : projectIds;
-    // Three sources to merge:
-    //  - own:           reviews this user created
-    //  - sharedProj:    reviews in a project the user has access to
-    //  - sharedDirect:  standalone reviews (project_id null) where the
-    //                   user's email is in tabular_reviews.shared_with
-    const [
-        { data: own, error: ownErr },
-        { data: shared, error: sharedErr },
-        { data: sharedDirect, error: sharedDirectErr },
-    ] = await Promise.all([
-        ownQuery,
-        sharedProjectIds.length > 0
-            ? db
-                  .from("tabular_reviews")
-                  .select("*")
-                  .in("project_id", sharedProjectIds)
-                  .neq("user_id", userId)
-                  .order("created_at", { ascending: false })
-            : Promise.resolve({
-                  data: [] as Record<string, unknown>[],
-                  error: null,
-              }),
-        // Skip the direct-share lookup when the caller is filtering to a
-        // specific project — direct shares are inherently project-id-null.
-        userEmail && !projectIdFilter
-            ? db
-                  .from("tabular_reviews")
-                  .select("*")
-                  .filter("shared_with", "cs", JSON.stringify([userEmail]))
-                  .neq("user_id", userId)
-                  .order("created_at", { ascending: false })
-            : Promise.resolve({
-                  data: [] as Record<string, unknown>[],
-                  error: null,
-              }),
-    ]);
-    if (ownErr) return void res.status(500).json({ detail: ownErr.message });
-    // Don't fail the whole list when an auxiliary share query errors — most
-    // commonly the tabular_reviews.shared_with column hasn't been migrated
-    // yet. Log and continue so the user still sees their own reviews.
-    if (sharedErr)
-        logger.warn(
-            { err: sharedErr },
-            "[tabular] shared-by-project query failed",
-        );
-    if (sharedDirectErr)
-        logger.warn(
-            { err: sharedDirectErr },
-            "[tabular] shared-by-email query failed",
-        );
+    // Shared via project
+    let shared: any[] = [];
+    if (sharedProjectIds.length > 0) {
+        shared = await prisma.tabularReview.findMany({
+            where: {
+                projectId: { in: sharedProjectIds },
+                userId: { not: userId },
+            },
+            orderBy: { createdAt: "desc" },
+        });
+    }
+
+    // Shared directly via email
+    let sharedDirect: any[] = [];
+    if (userEmail && !projectIdFilter) {
+        try {
+            sharedDirect = await prisma.tabularReview.findMany({
+                where: {
+                    sharedWith: { path: [], array_contains: [userEmail] },
+                    userId: { not: userId },
+                },
+                orderBy: { createdAt: "desc" },
+            });
+        } catch (err) {
+            logger.warn({ err }, "[tabular] shared-by-email query failed");
+        }
+    }
+
     const seen = new Set<string>();
     const reviews: Record<string, unknown>[] = [];
-    for (const r of [
-        ...(own ?? []),
-        ...(shared ?? []),
-        ...(sharedDirect ?? []),
-    ]) {
+    for (const r of [...own, ...shared, ...sharedDirect]) {
         const id = (r as { id: string }).id;
         if (seen.has(id)) continue;
         seen.add(id);
@@ -169,27 +149,24 @@ tabularRouter.get("/", requireAuth, async (req, res) => {
     const reviewsWithExplicitDocs = new Set<string>();
     for (const review of reviews) {
         const id = (review as { id: string }).id;
-        if (Array.isArray(review.document_ids)) {
-            const explicitDocIds = review.document_ids;
+        if (Array.isArray(review.documentIds)) {
             reviewsWithExplicitDocs.add(id);
-            docCounts[id] = new Set(explicitDocIds).size;
+            docCounts[id] = new Set(review.documentIds as string[]).size;
         }
     }
     if (reviewIds.length > 0) {
-        const { data: cells } = await db
-            .from("tabular_cells")
-            .select("review_id, document_id")
-            .in("review_id", reviewIds);
-        if (cells) {
-            const seen = new Set<string>();
-            for (const cell of cells) {
-                const key = `${cell.review_id}:${cell.document_id}`;
-                if (!seen.has(key)) {
-                    seen.add(key);
-                    if (!reviewsWithExplicitDocs.has(cell.review_id)) {
-                        docCounts[cell.review_id] =
-                            (docCounts[cell.review_id] ?? 0) + 1;
-                    }
+        const cells = await prisma.tabularCell.findMany({
+            where: { reviewId: { in: reviewIds } },
+            select: { reviewId: true, documentId: true },
+        });
+        const cellSeen = new Set<string>();
+        for (const cell of cells) {
+            const key = `${cell.reviewId}:${cell.documentId}`;
+            if (!cellSeen.has(key)) {
+                cellSeen.add(key);
+                if (!reviewsWithExplicitDocs.has(cell.reviewId)) {
+                    docCounts[cell.reviewId] =
+                        (docCounts[cell.reviewId] ?? 0) + 1;
                 }
             }
         }
@@ -216,13 +193,11 @@ tabularRouter.post("/", requireAuth, async (req, res) => {
             project_id?: string;
         };
 
-    const db = createServerSupabase();
     if (project_id) {
         const access = await checkProjectAccess(
             project_id,
             userId,
             userEmail,
-            db,
         );
         if (!access.ok)
             return void res.status(404).json({ detail: "Project not found" });
@@ -232,35 +207,37 @@ tabularRouter.post("/", requireAuth, async (req, res) => {
               document_ids,
               userId,
               userEmail,
-              db,
           )
         : [];
-    const { data: review, error } = await db
-        .from("tabular_reviews")
-        .insert({
-            user_id: userId,
+    const review = await prisma.tabularReview.create({
+        data: {
+            userId,
             title: title ?? null,
-            columns_config,
-            document_ids: allowedDocumentIds,
-            project_id: project_id ?? null,
-            workflow_id: workflow_id ?? null,
-        })
-        .select("*")
-        .single();
-    if (error || !review)
-        return void res
-            .status(500)
-            .json({ detail: error?.message ?? "Failed to create review" });
+            columnsConfig: columns_config,
+            documentIds: allowedDocumentIds,
+            projectId: project_id ?? null,
+            workflowId: workflow_id ?? null,
+        },
+    });
 
     const cells = allowedDocumentIds.flatMap((docId) =>
         columns_config.map((col) => ({
-            review_id: review.id,
-            document_id: docId,
-            column_index: col.index,
-            status: "pending",
+            reviewId: review.id,
+            documentId: docId,
+            columnIndex: col.index,
+            status: "pending" as const,
         })),
     );
-    if (cells.length) await db.from("tabular_cells").insert(cells);
+    if (cells.length) {
+        await prisma.tabularCell.createMany({ data: cells });
+    }
+
+    await auditLog({
+        userId,
+        action: "create",
+        entity: "tabularReview",
+        entityId: review.id,
+    });
 
     res.status(201).json(review);
 });
@@ -341,80 +318,70 @@ tabularRouter.get("/:reviewId", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
     const { reviewId } = req.params;
-    const db = createServerSupabase();
 
-    const { data: review, error } = await db
-        .from("tabular_reviews")
-        .select("*")
-        .eq("id", reviewId)
-        .single();
-    if (error || !review)
+    const review = await prisma.tabularReview.findUnique({
+        where: { id: reviewId },
+    });
+    if (!review)
         return void res.status(404).json({ detail: "Review not found" });
-    const access = await ensureReviewAccess(review, userId, userEmail, db);
+    const access = await ensureReviewAccess(review, userId, userEmail);
     if (!access.ok)
         return void res.status(404).json({ detail: "Review not found" });
 
-    const { data: cells } = await db
-        .from("tabular_cells")
-        .select("*")
-        .eq("review_id", reviewId);
-    const cellDocIds = [...new Set((cells ?? []).map((c) => c.document_id))];
-    const hasExplicitDocIds = Array.isArray(review.document_ids);
+    const cells = await prisma.tabularCell.findMany({
+        where: { reviewId },
+    });
+    const cellDocIds = [...new Set(cells.map((c) => c.documentId))];
+    const hasExplicitDocIds = Array.isArray(review.documentIds);
     const explicitDocIds = hasExplicitDocIds
-        ? (review.document_ids as string[])
+        ? (review.documentIds as string[])
         : [];
-    const docIds =
-        hasExplicitDocIds
-            ? explicitDocIds
-            : cellDocIds;
-    const docsResult =
+    const docIds = hasExplicitDocIds ? explicitDocIds : cellDocIds;
+    const documents =
         docIds.length > 0
-            ? await db.from("documents").select("*").in("id", docIds)
-            : { data: [] as Record<string, unknown>[] };
+            ? await prisma.document.findMany({ where: { id: { in: docIds } } })
+            : [];
 
     res.json({
         review: { ...review, is_owner: access.isOwner },
-        cells: (cells ?? []).map((cell) => ({
+        cells: cells.map((cell) => ({
             ...cell,
             content: parseCellContent(cell.content),
         })),
-        documents: docsResult.data ?? [],
+        documents,
     });
 });
 
 // GET /tabular-review/:reviewId/people
-// Owner email + display_name plus member display_names — the analog of
-// /projects/:id/people. Used by the standalone TR detail page's People
-// modal so the roster can show display_names alongside emails.
 tabularRouter.get("/:reviewId/people", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
     const { reviewId } = req.params;
-    const db = createServerSupabase();
 
-    const { data: review } = await db
-        .from("tabular_reviews")
-        .select("id, user_id, project_id, shared_with")
-        .eq("id", reviewId)
-        .single();
+    const review = await prisma.tabularReview.findUnique({
+        where: { id: reviewId },
+        select: { id: true, userId: true, projectId: true, sharedWith: true },
+    });
     if (!review)
         return void res.status(404).json({ detail: "Review not found" });
-    const access = await ensureReviewAccess(review, userId, userEmail, db);
+    const access = await ensureReviewAccess(review, userId, userEmail);
     if (!access.ok)
         return void res.status(404).json({ detail: "Review not found" });
 
     const sharedWith: string[] = (
-        Array.isArray(review.shared_with)
-            ? (review.shared_with as string[])
+        Array.isArray(review.sharedWith)
+            ? (review.sharedWith as string[])
             : []
     ).map((e) => (e ?? "").toLowerCase());
 
-    // Same pattern as /projects/:id/people: walk auth.users to map emails
-    // to user_ids, then pull display_names from user_profiles by user_id.
-    const { data: usersData } = await db.auth.admin.listUsers({
-        perPage: 1000,
-    });
-    const allUsers = usersData?.users ?? [];
+    // Auth user listing still uses Supabase admin API
+    const admin = getSupabaseAdmin();
+    const allUsers: { id: string; email?: string }[] = [];
+    if (admin) {
+        const { data: usersData } = await admin.auth.admin.listUsers({ perPage: 1000 });
+        if (usersData?.users) allUsers.push(...usersData.users);
+    }
+
     const userByEmail = new Map<string, { id: string; email: string }>();
     const userById = new Map<string, { id: string; email: string }>();
     for (const u of allUsers) {
@@ -430,30 +397,27 @@ tabularRouter.get("/:reviewId/people", requireAuth, async (req, res) => {
         if (u) memberUserIds.push(u.id);
     }
 
-    const profileIds = [review.user_id as string, ...memberUserIds].filter(
+    const profileIds = [review.userId, ...memberUserIds].filter(
         (x, i, arr) => arr.indexOf(x) === i,
     );
 
     const profileByUserId = new Map<string, string | null>();
     if (profileIds.length > 0) {
-        const { data: profiles } = await db
-            .from("user_profiles")
-            .select("user_id, display_name")
-            .in("user_id", profileIds);
-        for (const p of profiles ?? []) {
-            profileByUserId.set(
-                p.user_id as string,
-                (p.display_name as string | null) ?? null,
-            );
+        const profiles = await prisma.userProfile.findMany({
+            where: { userId: { in: profileIds } },
+            select: { userId: true, displayName: true },
+        });
+        for (const p of profiles) {
+            profileByUserId.set(p.userId, p.displayName ?? null);
         }
     }
 
-    const ownerInfo = userById.get(review.user_id as string);
+    const ownerInfo = userById.get(review.userId);
     res.json({
         owner: {
-            user_id: review.user_id,
+            user_id: review.userId,
             email: ownerInfo?.email ?? null,
-            display_name: profileByUserId.get(review.user_id as string) ?? null,
+            display_name: profileByUserId.get(review.userId) ?? null,
         },
         members: sharedWith.map((email) => {
             const u = userByEmail.get(email);
@@ -471,11 +435,9 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
     const updates: Record<string, unknown> = {};
     if (req.body.title != null) updates.title = req.body.title;
     if (req.body.columns_config != null)
-        updates.columns_config = req.body.columns_config;
+        updates.columnsConfig = req.body.columns_config;
     if (req.body.project_id !== undefined)
-        updates.project_id = req.body.project_id;
-    // shared_with edits are owner-only — gated below after we know who's
-    // making the call. Normalize lowercase + dedupe + drop empties.
+        updates.projectId = req.body.project_id;
     let sharedWithUpdate: string[] | undefined;
     if (Array.isArray(req.body.shared_with)) {
         const normalizedUserEmail = userEmail?.trim().toLowerCase();
@@ -495,21 +457,16 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
         }
         sharedWithUpdate = cleaned;
     }
-    updates.updated_at = new Date().toISOString();
 
-    const db = createServerSupabase();
-    const { data: existingReview, error: reviewError } = await db
-        .from("tabular_reviews")
-        .select("*")
-        .eq("id", reviewId)
-        .single();
-    if (reviewError || !existingReview)
+    const existingReview = await prisma.tabularReview.findUnique({
+        where: { id: reviewId },
+    });
+    if (!existingReview)
         return void res.status(404).json({ detail: "Review not found" });
     const access = await ensureReviewAccess(
         existingReview,
         userId,
         userEmail,
-        db,
     );
     if (!access.ok)
         return void res.status(404).json({ detail: "Review not found" });
@@ -518,42 +475,35 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
             return void res
                 .status(403)
                 .json({ detail: "Only the review owner can change sharing" });
-        updates.shared_with = sharedWithUpdate;
+        updates.sharedWith = sharedWithUpdate;
     }
 
-    const { data: updatedReview, error: updateError } = await db
-        .from("tabular_reviews")
-        .update(updates)
-        .eq("id", reviewId)
-        .select("*")
-        .single();
-    if (updateError || !updatedReview)
-        return void res.status(500).json({
-            detail: updateError?.message ?? "Failed to update review",
-        });
+    const updatedReview = await prisma.tabularReview.update({
+        where: { id: reviewId },
+        data: updates,
+    });
 
     let persistedDocumentIds: string[] | undefined;
     if (
         Array.isArray(req.body.columns_config) ||
         Array.isArray(req.body.document_ids)
     ) {
-        const { data: existingCells } = await db
-            .from("tabular_cells")
-            .select("document_id,column_index")
-            .eq("review_id", reviewId);
+        const existingCells = await prisma.tabularCell.findMany({
+            where: { reviewId },
+            select: { documentId: true, columnIndex: true },
+        });
         const existingKeys = new Set(
-            (existingCells ?? []).map(
-                (cell) => `${cell.document_id}:${cell.column_index}`,
+            existingCells.map(
+                (cell) => `${cell.documentId}:${cell.columnIndex}`,
             ),
         );
 
         let documentIds: string[];
 
         if (Array.isArray(req.body.document_ids)) {
-            // document_ids is the new source of truth — delete removed docs' cells
             const requestedDocIds = req.body.document_ids as string[];
-            const existingDocIds = (existingCells ?? []).map(
-                (cell) => cell.document_id,
+            const existingDocIds = existingCells.map(
+                (cell) => cell.documentId,
             );
             const existingDocIdSet = new Set(existingDocIds);
             const newDocCandidates = requestedDocIds.filter(
@@ -563,7 +513,6 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
                 newDocCandidates,
                 userId,
                 userEmail,
-                db,
             );
             const newDocAllowedSet = new Set(newDocAllowed);
             const newDocIds = requestedDocIds.filter(
@@ -574,45 +523,32 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
             );
 
             if (removedDocIds.length > 0) {
-                const { error: deleteError } = await db
-                    .from("tabular_cells")
-                    .delete()
-                    .eq("review_id", reviewId)
-                    .in("document_id", removedDocIds);
-                if (deleteError)
-                    return void res
-                        .status(500)
-                        .json({ detail: deleteError.message });
+                await prisma.tabularCell.deleteMany({
+                    where: {
+                        reviewId,
+                        documentId: { in: removedDocIds },
+                    },
+                });
             }
 
             documentIds = newDocIds;
         } else {
-            // No document change — derive from existing cells
             documentIds = [
-                ...new Set(
-                    (existingCells ?? []).map((cell) => cell.document_id),
-                ),
+                ...new Set(existingCells.map((cell) => cell.documentId)),
             ];
         }
 
         if (Array.isArray(req.body.document_ids)) {
             persistedDocumentIds = documentIds;
-            const { error: documentIdsError } = await db
-                .from("tabular_reviews")
-                .update({
-                    document_ids: documentIds,
-                    updated_at: new Date().toISOString(),
-                })
-                .eq("id", reviewId);
-            if (documentIdsError)
-                return void res.status(500).json({
-                    detail: documentIdsError.message,
-                });
+            await prisma.tabularReview.update({
+                where: { id: reviewId },
+                data: { documentIds: documentIds },
+            });
         }
 
         const activeColumns = Array.isArray(req.body.columns_config)
             ? req.body.columns_config
-            : (updatedReview.columns_config ?? []);
+            : ((updatedReview.columnsConfig ?? []) as any[]);
         const newCells = documentIds.flatMap((documentId) =>
             activeColumns
                 .filter(
@@ -620,23 +556,24 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
                         !existingKeys.has(`${documentId}:${column.index}`),
                 )
                 .map((column: { index: number }) => ({
-                    review_id: reviewId,
-                    document_id: documentId,
-                    column_index: column.index,
-                    status: "pending",
+                    reviewId,
+                    documentId,
+                    columnIndex: column.index,
+                    status: "pending" as const,
                 })),
         );
 
         if (newCells.length > 0) {
-            const { error: insertError } = await db
-                .from("tabular_cells")
-                .insert(newCells);
-            if (insertError)
-                return void res
-                    .status(500)
-                    .json({ detail: insertError.message });
+            await prisma.tabularCell.createMany({ data: newCells });
         }
     }
+
+    await auditLog({
+        userId,
+        action: "update",
+        entity: "tabularReview",
+        entityId: reviewId,
+    });
 
     res.json({
         ...updatedReview,
@@ -648,19 +585,26 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
 tabularRouter.delete("/:reviewId", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const { reviewId } = req.params;
-    const db = createServerSupabase();
-    const { error } = await db
-        .from("tabular_reviews")
-        .delete()
-        .eq("id", reviewId)
-        .eq("user_id", userId);
-    if (error) return void res.status(500).json({ detail: error.message });
+
+    const existing = await prisma.tabularReview.findFirst({
+        where: { id: reviewId, userId },
+    });
+    if (!existing)
+        return void res.status(404).json({ detail: "Review not found" });
+
+    await prisma.tabularReview.delete({ where: { id: reviewId } });
+
+    await auditLog({
+        userId,
+        action: "delete",
+        entity: "tabularReview",
+        entityId: reviewId,
+    });
+
     res.status(204).send();
 });
 
 // POST /tabular-review/:reviewId/clear-cells
-// Reset cells to an empty/pending state for the given document_ids. Does not
-// delete the rows — it blanks `content` and sets `status` back to "pending".
 tabularRouter.post("/:reviewId/clear-cells", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
@@ -672,24 +616,23 @@ tabularRouter.post("/:reviewId/clear-cells", requireAuth, async (req, res) => {
             .status(400)
             .json({ detail: "document_ids is required" });
 
-    const db = createServerSupabase();
-    const { data: review, error: reviewError } = await db
-        .from("tabular_reviews")
-        .select("id, user_id, project_id")
-        .eq("id", reviewId)
-        .single();
-    if (reviewError || !review)
+    const review = await prisma.tabularReview.findUnique({
+        where: { id: reviewId },
+        select: { id: true, userId: true, projectId: true },
+    });
+    if (!review)
         return void res.status(404).json({ detail: "Review not found" });
-    const access = await ensureReviewAccess(review, userId, userEmail, db);
+    const access = await ensureReviewAccess(review, userId, userEmail);
     if (!access.ok)
         return void res.status(404).json({ detail: "Review not found" });
 
-    const { error } = await db
-        .from("tabular_cells")
-        .update({ content: null, status: "pending" })
-        .eq("review_id", reviewId)
-        .in("document_id", document_ids);
-    if (error) return void res.status(500).json({ detail: error.message });
+    await prisma.tabularCell.updateMany({
+        where: {
+            reviewId,
+            documentId: { in: document_ids },
+        },
+        data: { content: null, status: "pending" },
+    });
     res.status(204).send();
 });
 
@@ -711,20 +654,17 @@ tabularRouter.post(
                 .status(400)
                 .json({ detail: "document_id and column_index are required" });
 
-        const db = createServerSupabase();
-        const { data: review, error: reviewError } = await db
-            .from("tabular_reviews")
-            .select("*")
-            .eq("id", reviewId)
-            .single();
-        if (reviewError || !review)
+        const review = await prisma.tabularReview.findUnique({
+            where: { id: reviewId },
+        });
+        if (!review)
             return void res.status(404).json({ detail: "Review not found" });
-        const access = await ensureReviewAccess(review, userId, userEmail, db);
+        const access = await ensureReviewAccess(review, userId, userEmail);
         if (!access.ok)
             return void res.status(404).json({ detail: "Review not found" });
 
         const column = (
-            review.columns_config as {
+            review.columnsConfig as {
                 index: number;
                 name: string;
                 prompt: string;
@@ -739,23 +679,18 @@ tabularRouter.post(
             [document_id],
             userId,
             userEmail,
-            db,
         );
         if (docAllowed.length === 0)
             return void res.status(404).json({ detail: "Document not found" });
-        const { data: doc } = await db
-            .from("documents")
-            .select("id, filename, file_type")
-            .eq("id", document_id)
-            .single();
+        const doc = await prisma.document.findUnique({
+            where: { id: document_id },
+            select: { id: true, filename: true, fileType: true },
+        });
         if (!doc)
             return void res.status(404).json({ detail: "Document not found" });
-        const docActive = await loadActiveVersion(document_id, db);
+        const docActive = await loadActiveVersion(document_id);
 
-        const { tabular_model, api_keys } = await getUserModelSettings(
-            userId,
-            db,
-        );
+        const { tabular_model, api_keys } = await getUserModelSettings(userId);
         const missingKey = missingModelApiKey(tabular_model, api_keys);
         if (missingKey) {
             return void res.status(422).json({
@@ -764,12 +699,14 @@ tabularRouter.post(
             });
         }
 
-        await db
-            .from("tabular_cells")
-            .update({ status: "generating", content: null })
-            .eq("review_id", reviewId)
-            .eq("document_id", document_id)
-            .eq("column_index", column_index);
+        await prisma.tabularCell.updateMany({
+            where: {
+                reviewId,
+                documentId: document_id,
+                columnIndex: column_index,
+            },
+            data: { status: "generating", content: null },
+        });
 
         let markdown = "";
         if (docActive) {
@@ -777,7 +714,7 @@ tabularRouter.post(
             if (buf) {
                 try {
                     markdown =
-                        (doc.file_type as string) === "pdf"
+                        doc.fileType === "pdf"
                             ? await extractPdfMarkdown(buf)
                             : await extractDocxMarkdown(buf);
                 } catch (err) {
@@ -791,7 +728,7 @@ tabularRouter.post(
 
         const result = await queryTabularCell(
             tabular_model,
-            doc.filename as string,
+            doc.filename,
             markdown,
             column.prompt,
             column.format,
@@ -800,21 +737,25 @@ tabularRouter.post(
         );
 
         if (!result) {
-            await db
-                .from("tabular_cells")
-                .update({ status: "error" })
-                .eq("review_id", reviewId)
-                .eq("document_id", document_id)
-                .eq("column_index", column_index);
+            await prisma.tabularCell.updateMany({
+                where: {
+                    reviewId,
+                    documentId: document_id,
+                    columnIndex: column_index,
+                },
+                data: { status: "failed" },
+            });
             return void res.status(500).json({ detail: "Generation failed" });
         }
 
-        await db
-            .from("tabular_cells")
-            .update({ content: JSON.stringify(result), status: "done" })
-            .eq("review_id", reviewId)
-            .eq("document_id", document_id)
-            .eq("column_index", column_index);
+        await prisma.tabularCell.updateMany({
+            where: {
+                reviewId,
+                documentId: document_id,
+                columnIndex: column_index,
+            },
+            data: { content: JSON.stringify(result), status: "complete" },
+        });
 
         res.json(result);
     },
@@ -825,16 +766,13 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
     const { reviewId } = req.params;
-    const db = createServerSupabase();
 
-    const { data: review, error: reviewError } = await db
-        .from("tabular_reviews")
-        .select("*")
-        .eq("id", reviewId)
-        .single();
-    if (reviewError || !review)
+    const review = await prisma.tabularReview.findUnique({
+        where: { id: reviewId },
+    });
+    if (!review)
         return void res.status(404).json({ detail: "Review not found" });
-    const access = await ensureReviewAccess(review, userId, userEmail, db);
+    const access = await ensureReviewAccess(review, userId, userEmail);
     if (!access.ok)
         return void res.status(404).json({ detail: "Review not found" });
 
@@ -844,43 +782,39 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
         prompt: string;
         format?: string;
         tags?: string[];
-    }[] = review.columns_config ?? [];
+    }[] = (review.columnsConfig as any[]) ?? [];
     if (columns.length === 0)
         return void res.status(400).json({ detail: "No columns configured" });
 
-    const { data: cells } = await db
-        .from("tabular_cells")
-        .select("*")
-        .eq("review_id", reviewId);
+    const cells = await prisma.tabularCell.findMany({
+        where: { reviewId },
+    });
     const cellMap = new Map<string, Record<string, unknown>>();
-    for (const cell of cells ?? [])
-        cellMap.set(`${cell.document_id}:${cell.column_index}`, cell);
+    for (const cell of cells)
+        cellMap.set(`${cell.documentId}:${cell.columnIndex}`, cell as unknown as Record<string, unknown>);
 
-    const docIds = [...new Set((cells ?? []).map((c) => c.document_id))];
+    const docIds = [...new Set(cells.map((c) => c.documentId))];
     const allowedDocIds = new Set(
-        await filterAccessibleDocumentIds(docIds, userId, userEmail, db),
+        await filterAccessibleDocumentIds(docIds, userId, userEmail),
     );
-    let docs: Record<string, unknown>[] = [];
+    let docs: { id: string; filename: string; fileType: string | null; pageCount: number | null }[] = [];
     if (docIds.length > 0) {
         const filteredIds = docIds.filter((id) => allowedDocIds.has(id));
-        const { data } =
-            filteredIds.length > 0
-                ? await db
-                      .from("documents")
-                      .select("id, filename, file_type, page_count")
-                      .in("id", filteredIds)
-                : { data: [] as Record<string, unknown>[] };
-        docs = data ?? [];
-    } else if (review.project_id) {
-        const { data } = await db
-            .from("documents")
-            .select("id, filename, file_type, page_count")
-            .eq("project_id", review.project_id)
-            .order("created_at", { ascending: true });
-        docs = data ?? [];
+        if (filteredIds.length > 0) {
+            docs = await prisma.document.findMany({
+                where: { id: { in: filteredIds } },
+                select: { id: true, filename: true, fileType: true, pageCount: true },
+            });
+        }
+    } else if (review.projectId) {
+        docs = await prisma.document.findMany({
+            where: { projectId: review.projectId },
+            select: { id: true, filename: true, fileType: true, pageCount: true },
+            orderBy: { createdAt: "asc" },
+        });
     }
 
-    const { tabular_model, api_keys } = await getUserModelSettings(userId, db);
+    const { tabular_model, api_keys } = await getUserModelSettings(userId);
     const missingKey = missingModelApiKey(tabular_model, api_keys);
     if (missingKey) {
         return void res.status(422).json({
@@ -900,17 +834,17 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
     try {
         await Promise.all(
             docs.map(async (doc) => {
-                const docId = doc.id as string;
-                const filename = doc.filename as string;
+                const docId = doc.id;
+                const filename = doc.filename;
                 let markdown = "";
 
-                const active = await loadActiveVersion(docId, db);
+                const active = await loadActiveVersion(docId);
                 if (active) {
                     const buf = await downloadFile(active.storage_path);
                     if (buf) {
                         try {
                             markdown =
-                                (doc.file_type as string) === "pdf"
+                                doc.fileType === "pdf"
                                     ? await extractPdfMarkdown(buf)
                                     : await extractDocxMarkdown(buf);
                         } catch (err) {
@@ -922,35 +856,34 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
                     }
                 }
 
-                // Filter to only columns that need processing
                 const columnsToProcess = columns.filter((col) => {
                     const cell = cellMap.get(`${docId}:${col.index}`);
-                    return !(cell?.status === "done" && cell?.content);
+                    return !(cell?.status === "complete" && cell?.content);
                 });
                 if (columnsToProcess.length === 0) return;
 
-                // Mark all as generating upfront
                 for (const col of columnsToProcess) {
                     write(
                         `data: ${JSON.stringify({ type: "cell_update", document_id: docId, column_index: col.index, content: null, status: "generating" })}\n\n`,
                     );
                     const existingCell = cellMap.get(`${docId}:${col.index}`);
                     if (existingCell) {
-                        await db
-                            .from("tabular_cells")
-                            .update({ status: "generating", content: null })
-                            .eq("id", existingCell.id);
+                        await prisma.tabularCell.update({
+                            where: { id: existingCell.id as string },
+                            data: { status: "generating", content: null },
+                        });
                     } else {
-                        await db.from("tabular_cells").insert({
-                            review_id: reviewId,
-                            document_id: docId,
-                            column_index: col.index,
-                            status: "generating",
+                        await prisma.tabularCell.create({
+                            data: {
+                                reviewId,
+                                documentId: docId,
+                                columnIndex: col.index,
+                                status: "generating",
+                            },
                         });
                     }
                 }
 
-                // Single LLM call for all columns, streaming one JSON line per column
                 const receivedColumns = new Set<number>();
                 try {
                     await queryTabularAllColumns(
@@ -960,15 +893,17 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
                         columnsToProcess,
                         async (columnIndex, result) => {
                             receivedColumns.add(columnIndex);
-                            await db
-                                .from("tabular_cells")
-                                .update({
+                            await prisma.tabularCell.updateMany({
+                                where: {
+                                    reviewId,
+                                    documentId: docId,
+                                    columnIndex,
+                                },
+                                data: {
                                     content: JSON.stringify(result),
-                                    status: "done",
-                                })
-                                .eq("review_id", reviewId)
-                                .eq("document_id", docId)
-                                .eq("column_index", columnIndex);
+                                    status: "complete",
+                                },
+                            });
                             write(
                                 `data: ${JSON.stringify({ type: "cell_update", document_id: docId, column_index: columnIndex, content: result, status: "done" })}\n\n`,
                             );
@@ -982,15 +917,16 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
                     );
                 }
 
-                // Mark any columns the LLM didn't return as error
                 for (const col of columnsToProcess) {
                     if (!receivedColumns.has(col.index)) {
-                        await db
-                            .from("tabular_cells")
-                            .update({ status: "error" })
-                            .eq("review_id", reviewId)
-                            .eq("document_id", docId)
-                            .eq("column_index", col.index);
+                        await prisma.tabularCell.updateMany({
+                            where: {
+                                reviewId,
+                                documentId: docId,
+                                columnIndex: col.index,
+                            },
+                            data: { status: "failed" },
+                        });
                         write(
                             `data: ${JSON.stringify({ type: "cell_update", document_id: docId, column_index: col.index, content: null, status: "error" })}\n\n`,
                         );
@@ -1014,57 +950,51 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
     }
 });
 
-// GET /tabular-review/:reviewId/chats — list chats (metadata only, no messages)
+// GET /tabular-review/:reviewId/chats
 tabularRouter.get("/:reviewId/chats", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
     const { reviewId } = req.params;
-    const db = createServerSupabase();
 
-    // Verify access (owner or shared-project member).
-    const { data: review, error } = await db
-        .from("tabular_reviews")
-        .select("id, user_id, project_id")
-        .eq("id", reviewId)
-        .single();
-    if (error || !review)
+    const review = await prisma.tabularReview.findUnique({
+        where: { id: reviewId },
+        select: { id: true, userId: true, projectId: true },
+    });
+    if (!review)
         return void res.status(404).json({ detail: "Review not found" });
-    const access = await ensureReviewAccess(review, userId, userEmail, db);
+    const access = await ensureReviewAccess(review, userId, userEmail);
     if (!access.ok)
         return void res.status(404).json({ detail: "Review not found" });
 
-    // Show every member's chats for the review (collaborative), not just
-    // the requester's. Per-chat access is gated above by review access.
-    const { data: chats } = await db
-        .from("tabular_review_chats")
-        .select("id, title, created_at, updated_at, user_id")
-        .eq("review_id", reviewId)
-        .order("updated_at", { ascending: false });
+    const chats = await prisma.tabularReviewChat.findMany({
+        where: { reviewId },
+        select: { id: true, title: true, createdAt: true, updatedAt: true, userId: true },
+        orderBy: { updatedAt: "desc" },
+    });
 
-    res.json(chats ?? []);
+    res.json(chats);
 });
 
-// DELETE /tabular-review/:reviewId/chats/:chatId — delete a single chat
+// DELETE /tabular-review/:reviewId/chats/:chatId
 tabularRouter.delete(
     "/:reviewId/chats/:chatId",
     requireAuth,
     async (req, res) => {
         const userId = res.locals.userId as string;
         const { chatId } = req.params;
-        const db = createServerSupabase();
-        // Owner-only delete — sibling collaborators shouldn't be able to wipe
-        // each other's threads.
-        const { error } = await db
-            .from("tabular_review_chats")
-            .delete()
-            .eq("id", chatId)
-            .eq("user_id", userId);
-        if (error) return void res.status(500).json({ detail: error.message });
+        // Owner-only delete
+        const existing = await prisma.tabularReviewChat.findFirst({
+            where: { id: chatId, userId },
+        });
+        if (!existing)
+            return void res.status(404).json({ detail: "Chat not found" });
+
+        await prisma.tabularReviewChat.delete({ where: { id: chatId } });
         res.status(204).send();
     },
 );
 
-// GET /tabular-review/:reviewId/chats/:chatId/messages — messages for a single chat
+// GET /tabular-review/:reviewId/chats/:chatId/messages
 tabularRouter.get(
     "/:reviewId/chats/:chatId/messages",
     requireAuth,
@@ -1072,34 +1002,31 @@ tabularRouter.get(
         const userId = res.locals.userId as string;
         const userEmail = res.locals.userEmail as string | undefined;
         const { reviewId, chatId } = req.params;
-        const db = createServerSupabase();
 
-        const { data: review } = await db
-            .from("tabular_reviews")
-            .select("id, user_id, project_id")
-            .eq("id", reviewId)
-            .single();
+        const review = await prisma.tabularReview.findUnique({
+            where: { id: reviewId },
+            select: { id: true, userId: true, projectId: true },
+        });
         if (!review)
             return void res.status(404).json({ detail: "Review not found" });
-        const access = await ensureReviewAccess(review, userId, userEmail, db);
+        const access = await ensureReviewAccess(review, userId, userEmail);
         if (!access.ok)
             return void res.status(404).json({ detail: "Review not found" });
 
-        const { data: chat, error: chatError } = await db
-            .from("tabular_review_chats")
-            .select("id, review_id")
-            .eq("id", chatId)
-            .single();
-        if (chatError || !chat || chat.review_id !== reviewId)
+        const chat = await prisma.tabularReviewChat.findUnique({
+            where: { id: chatId },
+            select: { id: true, reviewId: true },
+        });
+        if (!chat || chat.reviewId !== reviewId)
             return void res.status(404).json({ detail: "Chat not found" });
 
-        const { data: messages } = await db
-            .from("tabular_review_chat_messages")
-            .select("id, role, content, annotations, created_at")
-            .eq("chat_id", chatId)
-            .order("created_at", { ascending: true });
+        const messages = await prisma.tabularReviewChatMessage.findMany({
+            where: { chatId },
+            select: { id: true, role: true, content: true, annotations: true, createdAt: true },
+            orderBy: { createdAt: "asc" },
+        });
 
-        res.json(messages ?? []);
+        res.json(messages);
     },
 );
 
@@ -1202,7 +1129,6 @@ Rules:
 // POST /tabular-review/:reviewId/chat — agentic streaming
 // ---------------------------------------------------------------------------
 
-// POST /tabular-review/:reviewId/chat
 tabularRouter.post("/:reviewId/chat", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
@@ -1228,58 +1154,51 @@ tabularRouter.post("/:reviewId/chat", requireAuth, async (req, res) => {
             .json({ detail: "messages must include a user message" });
     }
 
-    const db = createServerSupabase();
-    const { data: review, error } = await db
-        .from("tabular_reviews")
-        .select("*")
-        .eq("id", reviewId)
-        .single();
-    if (error || !review)
+    const review = await prisma.tabularReview.findUnique({
+        where: { id: reviewId },
+    });
+    if (!review)
         return void res.status(404).json({ detail: "Review not found" });
     const reviewAccess = await ensureReviewAccess(
         review,
         userId,
         userEmail,
-        db,
     );
     if (!reviewAccess.ok)
         return void res.status(404).json({ detail: "Review not found" });
 
-    // Fetch all cells and documents for this review
-    const { data: cells } = await db
-        .from("tabular_cells")
-        .select("*")
-        .eq("review_id", reviewId);
+    const cells = await prisma.tabularCell.findMany({
+        where: { reviewId },
+    });
 
     const docIds = [
-        ...new Set((cells ?? []).map((c: any) => c.document_id as string)),
+        ...new Set(cells.map((c) => c.documentId)),
     ];
     let docs: { id: string; filename: string }[] = [];
     if (docIds.length > 0) {
-        const { data } = await db
-            .from("documents")
-            .select("id, filename")
-            .in("id", docIds)
-            .order("created_at", { ascending: true });
-        docs = (data ?? []) as { id: string; filename: string }[];
+        docs = await prisma.document.findMany({
+            where: { id: { in: docIds } },
+            select: { id: true, filename: true },
+            orderBy: { createdAt: "asc" },
+        });
     }
 
     const sortedColumns = (
-        (review.columns_config ?? []) as { index: number; name: string }[]
+        (review.columnsConfig ?? []) as { index: number; name: string }[]
     ).sort((a, b) => a.index - b.index);
 
     const tabularStore: TabularCellStore = {
         columns: sortedColumns,
         documents: docs,
         cells: new Map(
-            (cells ?? []).map((c: any) => [
-                `${c.column_index}:${c.document_id}`,
+            cells.map((c) => [
+                `${c.columnIndex}:${c.documentId}`,
                 parseCellContent(c.content),
             ]),
         ),
     };
 
-    const { tabular_model, api_keys } = await getUserModelSettings(userId, db);
+    const { tabular_model, api_keys } = await getUserModelSettings(userId);
     const missingKey = missingModelApiKey(tabular_model, api_keys);
     if (missingKey) {
         return void res.status(422).json({
@@ -1295,36 +1214,34 @@ tabularRouter.post("/:reviewId/chat", requireAuth, async (req, res) => {
         messages.filter((m) => m.role === "user").length === 1;
 
     if (chatId) {
-        // Either chat owner OR any project member of the parent review can
-        // continue the chat. We've already verified review access above.
-        const { data: existing } = await db
-            .from("tabular_review_chats")
-            .select("id, title, review_id, user_id")
-            .eq("id", chatId)
-            .single();
+        const existing = await prisma.tabularReviewChat.findUnique({
+            where: { id: chatId },
+            select: { id: true, title: true, reviewId: true, userId: true },
+        });
         const canUse =
             !!existing &&
-            (existing.review_id === reviewId || existing.user_id === userId);
+            (existing.reviewId === reviewId || existing.userId === userId);
         if (!canUse || !existing) chatId = null;
         else chatTitle = existing.title;
     }
 
     if (!chatId) {
-        const { data: newChat } = await db
-            .from("tabular_review_chats")
-            .insert({ review_id: reviewId, user_id: userId })
-            .select("id, title")
-            .single();
-        chatId = newChat?.id ?? null;
-        chatTitle = newChat?.title ?? null;
+        const newChat = await prisma.tabularReviewChat.create({
+            data: { reviewId, userId },
+            select: { id: true, title: true },
+        });
+        chatId = newChat.id;
+        chatTitle = newChat.title;
     }
 
     // Persist user message
     if (chatId) {
-        await db.from("tabular_review_chat_messages").insert({
-            chat_id: chatId,
-            role: "user",
-            content: lastUser.content,
+        await prisma.tabularReviewChatMessage.create({
+            data: {
+                chatId,
+                role: "user",
+                content: lastUser.content,
+            },
         });
     }
 
@@ -1351,7 +1268,6 @@ tabularRouter.post("/:reviewId/chat", requireAuth, async (req, res) => {
             docStore: new Map(),
             docIndex: {},
             userId,
-            db,
             write,
             extraTools: TABULAR_TOOLS,
             tabularStore,
@@ -1364,21 +1280,23 @@ tabularRouter.post("/:reviewId/chat", requireAuth, async (req, res) => {
         const annotations = extractTabularAnnotations(fullText, tabularStore);
 
         if (chatId) {
-            await db.from("tabular_review_chat_messages").insert({
-                chat_id: chatId,
-                role: "assistant",
-                content: events.length ? events : null,
-                annotations: annotations.length ? annotations : null,
+            await prisma.tabularReviewChatMessage.create({
+                data: {
+                    chatId,
+                    role: "assistant",
+                    content: events.length ? events : undefined,
+                    annotations: annotations.length ? annotations : undefined,
+                },
             });
-            await db
-                .from("tabular_review_chats")
-                .update({ updated_at: new Date().toISOString() })
-                .eq("id", chatId);
+            await prisma.tabularReviewChat.update({
+                where: { id: chatId },
+                data: {},  // triggers @updatedAt
+            });
         }
 
         // Generate title on first exchange
         if (chatId && isFirstExchange && !chatTitle && lastUser.content) {
-            const { title_model } = await getUserModelSettings(userId, db);
+            const { title_model } = await getUserModelSettings(userId);
             const title = await generateChatTitle(
                 title_model,
                 lastUser.content,
@@ -1389,10 +1307,10 @@ tabularRouter.post("/:reviewId/chat", requireAuth, async (req, res) => {
                 api_keys,
             );
             if (title) {
-                await db
-                    .from("tabular_review_chats")
-                    .update({ title })
-                    .eq("id", chatId);
+                await prisma.tabularReviewChat.update({
+                    where: { id: chatId },
+                    data: { title },
+                });
                 write(
                     `data: ${JSON.stringify({ type: "chat_title", chatId, title })}\n\n`,
                 );
@@ -1549,54 +1467,6 @@ async function generateChatTitle(
     } catch {
         return null;
     }
-}
-
-function buildTabularContext(
-    columns: any[],
-    docs: any[],
-    cells: any[],
-): string {
-    const lines: string[] = [
-        "# Tabular Review Context\n",
-        "Columns (0-based index):",
-    ];
-    columns.forEach((col: any, i: number) =>
-        lines.push(`- COL:${i} → "${col.name}"`),
-    );
-    lines.push("", "Documents (0-based row index):");
-    docs.forEach((doc: any, i: number) =>
-        lines.push(`- ROW:${i} → "${doc.filename}"`),
-    );
-    lines.push("", "## Table Data\n");
-    lines.push(`| Document | ${columns.map((c: any) => c.name).join(" | ")} |`);
-    lines.push(`|---|${columns.map(() => "---").join("|")}|`);
-    docs.forEach((doc: any, rowIdx: number) => {
-        const rowCells = columns.map((col: any, colPos: number) => {
-            const cell = cells.find(
-                (c: any) =>
-                    c.document_id === doc.id && c.column_index === col.index,
-            ) as any;
-            if (
-                !cell ||
-                cell.status === "pending" ||
-                cell.status === "generating"
-            ) {
-                return `(pending) [[COL:${colPos}||ROW:${rowIdx}]]`;
-            }
-            if (cell.status === "error") {
-                return `(error) [[COL:${colPos}||ROW:${rowIdx}]]`;
-            }
-            const content = parseCellContent(cell.content);
-            const summary = content?.summary?.trim() || "(not yet generated)";
-            const truncated =
-                summary.length > 400 ? summary.slice(0, 400) + "…" : summary;
-            return `${truncated} [[COL:${colPos}||ROW:${rowIdx}]]`;
-        });
-        lines.push(
-            `| ROW:${rowIdx} ${doc.filename} | ${rowCells.join(" | ")} |`,
-        );
-    });
-    return lines.join("\n");
 }
 
 type CellResult = {

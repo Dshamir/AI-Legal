@@ -1,16 +1,15 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { requireAuth } from "../middleware/auth";
-import { createServerSupabase } from "../lib/supabase";
+import { prisma } from "../lib/prisma";
 import { logger } from "../lib/logger";
+import { auditLog } from "../lib/audit";
 
 export const workflowsRouter = Router();
 
-type Db = ReturnType<typeof createServerSupabase>;
-
 type WorkflowRecord = {
   id: string;
-  user_id: string | null;
-  is_system: boolean;
+  userId: string | null;
+  isSystem: boolean;
   [key: string]: unknown;
 };
 
@@ -43,7 +42,6 @@ function withWorkflowAccess<T extends Record<string, unknown>>(
 }
 
 async function loadSharerNames(
-  db: Db,
   sharerIds: string[],
 ): Promise<Map<string, string>> {
   const uniqueIds = [...new Set(sharerIds.filter(Boolean))];
@@ -51,40 +49,23 @@ async function loadSharerNames(
   if (uniqueIds.length === 0) return names;
 
   try {
-    const { data: profiles, error } = await db
-      .from("user_profiles")
-      .select("user_id, display_name")
-      .in("user_id", uniqueIds);
+    const profiles = await prisma.userProfile.findMany({
+      where: { userId: { in: uniqueIds } },
+      select: { userId: true, displayName: true },
+    });
 
-    if (error) {
-      logger.warn({ err: error }, "[workflows] failed to load sharer profiles");
-    } else {
-      for (const profile of profiles ?? []) {
-        if (profile.user_id && profile.display_name) {
-          names.set(profile.user_id, profile.display_name);
-        }
+    for (const profile of profiles) {
+      if (profile.userId && profile.displayName) {
+        names.set(profile.userId, profile.displayName);
       }
     }
   } catch (err) {
     logger.warn({ err }, "[workflows] sharer profile lookup threw");
   }
 
-  const missingIds = uniqueIds.filter((id) => !names.has(id));
-  const results = await Promise.allSettled(
-    missingIds.map(async (id) => {
-      const { data, error } = await db.auth.admin.getUserById(id);
-      if (error) throw error;
-      return { id, email: data.user?.email ?? null };
-    }),
-  );
-
-  for (const result of results) {
-    if (result.status === "fulfilled" && result.value.email) {
-      names.set(result.value.id, result.value.email);
-    } else if (result.status === "rejected") {
-      logger.warn({ err: result.reason }, "[workflows] failed to load sharer email");
-    }
-  }
+  // For missing profiles, we can't look up emails without Supabase auth.
+  // In future, consider a user table or auth integration.
+  // For now, just return what we have from profiles.
 
   return names;
 }
@@ -93,31 +74,29 @@ async function resolveWorkflowAccess(
   workflowId: string,
   userId: string,
   userEmail: string | null | undefined,
-  db: Db,
 ): Promise<WorkflowAccess> {
-  const { data: workflow } = await db
-    .from("workflows")
-    .select("*")
-    .eq("id", workflowId)
-    .single();
+  const workflow = await prisma.workflow.findUnique({
+    where: { id: workflowId },
+  });
   if (!workflow) return null;
-  const workflowRecord = workflow as WorkflowRecord;
-  if (workflowRecord.user_id === userId) {
+  const workflowRecord = workflow as unknown as WorkflowRecord;
+  if (workflowRecord.userId === userId) {
     return { workflow: workflowRecord, allowEdit: true, isOwner: true };
   }
 
   const normalizedUserEmail = (userEmail ?? "").trim().toLowerCase();
   if (!normalizedUserEmail) return null;
 
-  const { data: share } = await db
-    .from("workflow_shares")
-    .select("allow_edit")
-    .eq("workflow_id", workflowId)
-    .eq("shared_with_email", normalizedUserEmail)
-    .maybeSingle();
+  const share = await prisma.workflowShare.findFirst({
+    where: {
+      workflowId,
+      sharedWithEmail: normalizedUserEmail,
+    },
+    select: { allowEdit: true },
+  });
   if (!share) return null;
 
-  return { workflow: workflowRecord, allowEdit: !!share.allow_edit, isOwner: false };
+  return { workflow: workflowRecord, allowEdit: share.allowEdit, isOwner: false };
 }
 
 // GET /workflows
@@ -125,43 +104,46 @@ workflowsRouter.get("/", requireAuth, asyncRoute(async (req, res) => {
   const userId = res.locals.userId as string;
   const userEmail = res.locals.userEmail as string;
   const { type } = req.query as { type?: string };
-  const db = createServerSupabase();
 
   // Own workflows
-  let ownQuery = db
-    .from("workflows")
-    .select("*")
-    .eq("user_id", userId)
-    .eq("is_system", false)
-    .order("created_at", { ascending: false });
-  if (type) ownQuery = ownQuery.eq("type", type);
-  const { data: own, error: ownErr } = await ownQuery;
-  if (ownErr) return void res.status(500).json({ detail: ownErr.message });
+  const ownWhere: Record<string, unknown> = {
+    userId,
+    isSystem: false,
+  };
+  if (type) ownWhere.type = type;
+  const own = await prisma.workflow.findMany({
+    where: ownWhere,
+    orderBy: { createdAt: "desc" },
+  });
 
   // Shared workflows (where the current user's email appears in workflow_shares)
   const normalizedUserEmail = userEmail.trim().toLowerCase();
-  const { data: shares } = await db
-    .from("workflow_shares")
-    .select("workflow_id, shared_by_user_id, allow_edit")
-    .eq("shared_with_email", normalizedUserEmail);
+  const shares = await prisma.workflowShare.findMany({
+    where: { sharedWithEmail: normalizedUserEmail },
+    select: { workflowId: true, sharedByUserId: true, allowEdit: true },
+  });
 
   let sharedWorkflows: Record<string, unknown>[] = [];
-  if (shares && shares.length > 0) {
-    const sharedIds = shares.map((s) => s.workflow_id);
-    let sharedQuery = db.from("workflows").select("*").in("id", sharedIds);
-    if (type) sharedQuery = sharedQuery.eq("type", type);
-    const { data: wfs } = await sharedQuery;
+  if (shares.length > 0) {
+    const sharedIds = shares.map((s) => s.workflowId);
+    const sharedWhere: Record<string, unknown> = {
+      id: { in: sharedIds },
+    };
+    if (type) sharedWhere.type = type;
+    const wfs = await prisma.workflow.findMany({
+      where: sharedWhere,
+    });
 
-    if (wfs && wfs.length > 0) {
-      const sharerIds = [...new Set(shares.map((s) => s.shared_by_user_id).filter(Boolean))];
-      const sharerNames = await loadSharerNames(db, sharerIds);
+    if (wfs.length > 0) {
+      const sharerIds = [...new Set(shares.map((s) => s.sharedByUserId).filter(Boolean))];
+      const sharerNames = await loadSharerNames(sharerIds);
 
       sharedWorkflows = wfs.map((wf) => {
-        const share = shares.find((s) => s.workflow_id === wf.id);
-        const sharerId = share?.shared_by_user_id;
+        const share = shares.find((s) => s.workflowId === wf.id);
+        const sharerId = share?.sharedByUserId;
         const shared_by_name = sharerId ? sharerNames.get(sharerId) ?? null : null;
-        return withWorkflowAccess(wf, {
-          allowEdit: !!share?.allow_edit,
+        return withWorkflowAccess(wf as unknown as Record<string, unknown>, {
+          allowEdit: !!share?.allowEdit,
           isOwner: false,
           sharedByName: shared_by_name,
         });
@@ -169,8 +151,8 @@ workflowsRouter.get("/", requireAuth, asyncRoute(async (req, res) => {
     }
   }
 
-  const ownWithFlag = (own ?? []).map((wf) =>
-    withWorkflowAccess(wf, { allowEdit: true, isOwner: true }),
+  const ownWithFlag = own.map((wf) =>
+    withWorkflowAccess(wf as unknown as Record<string, unknown>, { allowEdit: true, isOwner: true }),
   );
   res.json([...ownWithFlag, ...sharedWorkflows]);
 }));
@@ -192,22 +174,26 @@ workflowsRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
       .status(400)
       .json({ detail: "type must be 'assistant' or 'tabular'" });
 
-  const db = createServerSupabase();
-  const { data, error } = await db
-    .from("workflows")
-    .insert({
-      user_id: userId,
+  const workflow = await prisma.workflow.create({
+    data: {
+      userId,
       title: title.trim(),
       type,
-      prompt_md: prompt_md ?? null,
-      columns_config: columns_config ?? null,
+      promptMd: prompt_md ?? null,
+      columnsConfig: columns_config ?? undefined,
       practice: practice ?? null,
-      is_system: false,
-    })
-    .select("*")
-    .single();
-  if (error) return void res.status(500).json({ detail: error.message });
-  res.status(201).json(data);
+      isSystem: false,
+    },
+  });
+
+  await auditLog({
+    userId,
+    action: "create",
+    entity: "workflow",
+    entityId: workflow.id,
+  });
+
+  res.status(201).json(workflow);
 }));
 
 async function handleWorkflowUpdate(req: Request, res: Response) {
@@ -216,31 +202,32 @@ async function handleWorkflowUpdate(req: Request, res: Response) {
   const { workflowId } = req.params;
   const updates: Record<string, unknown> = {};
   if (req.body.title != null) updates.title = req.body.title;
-  if (req.body.prompt_md != null) updates.prompt_md = req.body.prompt_md;
+  if (req.body.prompt_md != null) updates.promptMd = req.body.prompt_md;
   if (req.body.columns_config != null)
-    updates.columns_config = req.body.columns_config;
+    updates.columnsConfig = req.body.columns_config;
   if ("practice" in req.body) updates.practice = req.body.practice ?? null;
 
-  const db = createServerSupabase();
-  const access = await resolveWorkflowAccess(workflowId, userId, userEmail, db);
-  if (!access || access.workflow.is_system || !access.allowEdit) {
+  const access = await resolveWorkflowAccess(workflowId, userId, userEmail);
+  if (!access || access.workflow.isSystem || !access.allowEdit) {
     return void res
       .status(404)
       .json({ detail: "Workflow not found or not editable" });
   }
-  const { data, error } = await db
-    .from("workflows")
-    .update(updates)
-    .eq("id", workflowId)
-    .eq("is_system", false)
-    .select("*")
-    .single();
-  if (error || !data)
-    return void res
-      .status(404)
-      .json({ detail: "Workflow not found or not editable" });
+
+  const data = await prisma.workflow.update({
+    where: { id: workflowId },
+    data: updates,
+  });
+
+  await auditLog({
+    userId,
+    action: "update",
+    entity: "workflow",
+    entityId: workflowId,
+  });
+
   res.json(
-    withWorkflowAccess(data, {
+    withWorkflowAccess(data as unknown as Record<string, unknown>, {
       allowEdit: access.allowEdit,
       isOwner: access.isOwner,
     }),
@@ -257,27 +244,33 @@ workflowsRouter.patch("/:workflowId", requireAuth, asyncRoute(handleWorkflowUpda
 workflowsRouter.delete("/:workflowId", requireAuth, asyncRoute(async (req, res) => {
   const userId = res.locals.userId as string;
   const { workflowId } = req.params;
-  const db = createServerSupabase();
-  const { error } = await db
-    .from("workflows")
-    .delete()
-    .eq("id", workflowId)
-    .eq("user_id", userId)
-    .eq("is_system", false);
-  if (error) return void res.status(500).json({ detail: error.message });
+
+  // Verify ownership + non-system before deleting
+  const wf = await prisma.workflow.findFirst({
+    where: { id: workflowId, userId, isSystem: false },
+  });
+  if (!wf) return void res.status(404).json({ detail: "Workflow not found" });
+
+  await prisma.workflow.delete({ where: { id: workflowId } });
+
+  await auditLog({
+    userId,
+    action: "delete",
+    entity: "workflow",
+    entityId: workflowId,
+  });
+
   res.status(204).send();
 }));
 
 // GET /workflows/hidden
 workflowsRouter.get("/hidden", requireAuth, asyncRoute(async (req, res) => {
   const userId = res.locals.userId as string;
-  const db = createServerSupabase();
-  const { data, error } = await db
-    .from("hidden_workflows")
-    .select("workflow_id")
-    .eq("user_id", userId);
-  if (error) return void res.status(500).json({ detail: error.message });
-  res.json((data ?? []).map((r) => r.workflow_id));
+  const hidden = await prisma.hiddenWorkflow.findMany({
+    where: { userId },
+    select: { workflowId: true },
+  });
+  res.json(hidden.map((r) => r.workflowId));
 }));
 
 // POST /workflows/hidden
@@ -286,11 +279,12 @@ workflowsRouter.post("/hidden", requireAuth, asyncRoute(async (req, res) => {
   const { workflow_id } = req.body as { workflow_id: string };
   if (!workflow_id?.trim())
     return void res.status(400).json({ detail: "workflow_id is required" });
-  const db = createServerSupabase();
-  const { error } = await db
-    .from("hidden_workflows")
-    .upsert({ user_id: userId, workflow_id }, { onConflict: "user_id,workflow_id" });
-  if (error) return void res.status(500).json({ detail: error.message });
+
+  await prisma.hiddenWorkflow.upsert({
+    where: { userId_workflowId: { userId, workflowId: workflow_id } },
+    create: { userId, workflowId: workflow_id },
+    update: {},
+  });
   res.status(204).send();
 }));
 
@@ -298,13 +292,9 @@ workflowsRouter.post("/hidden", requireAuth, asyncRoute(async (req, res) => {
 workflowsRouter.delete("/hidden/:workflowId", requireAuth, asyncRoute(async (req, res) => {
   const userId = res.locals.userId as string;
   const { workflowId } = req.params;
-  const db = createServerSupabase();
-  const { error } = await db
-    .from("hidden_workflows")
-    .delete()
-    .eq("user_id", userId)
-    .eq("workflow_id", workflowId);
-  if (error) return void res.status(500).json({ detail: error.message });
+  await prisma.hiddenWorkflow.deleteMany({
+    where: { userId, workflowId },
+  });
   res.status(204).send();
 }));
 
@@ -313,12 +303,11 @@ workflowsRouter.get("/:workflowId", requireAuth, asyncRoute(async (req, res) => 
   const userId = res.locals.userId as string;
   const userEmail = res.locals.userEmail as string | undefined;
   const { workflowId } = req.params;
-  const db = createServerSupabase();
-  const access = await resolveWorkflowAccess(workflowId, userId, userEmail, db);
+  const access = await resolveWorkflowAccess(workflowId, userId, userEmail);
   if (!access)
     return void res.status(404).json({ detail: "Workflow not found" });
   res.json(
-    withWorkflowAccess(access.workflow, {
+    withWorkflowAccess(access.workflow as unknown as Record<string, unknown>, {
       allowEdit: access.allowEdit,
       isOwner: access.isOwner,
     }),
@@ -329,42 +318,34 @@ workflowsRouter.get("/:workflowId", requireAuth, asyncRoute(async (req, res) => 
 workflowsRouter.get("/:workflowId/shares", requireAuth, asyncRoute(async (req, res) => {
   const userId = res.locals.userId as string;
   const { workflowId } = req.params;
-  const db = createServerSupabase();
 
-  const { data: wf } = await db
-    .from("workflows")
-    .select("id")
-    .eq("id", workflowId)
-    .eq("user_id", userId)
-    .eq("is_system", false)
-    .single();
+  const wf = await prisma.workflow.findFirst({
+    where: { id: workflowId, userId, isSystem: false },
+  });
   if (!wf) return void res.status(404).json({ detail: "Workflow not found or not editable" });
 
-  const { data: shares, error } = await db
-    .from("workflow_shares")
-    .select("id, shared_with_email, allow_edit, created_at")
-    .eq("workflow_id", workflowId)
-    .order("created_at", { ascending: true });
-  if (error) return void res.status(500).json({ detail: error.message });
+  const shares = await prisma.workflowShare.findMany({
+    where: { workflowId },
+    select: { id: true, sharedWithEmail: true, allowEdit: true, createdAt: true },
+    orderBy: { createdAt: "asc" },
+  });
 
-  res.json(shares ?? []);
+  res.json(shares);
 }));
 
 // DELETE /workflows/:workflowId/shares/:shareId
 workflowsRouter.delete("/:workflowId/shares/:shareId", requireAuth, asyncRoute(async (req, res) => {
   const userId = res.locals.userId as string;
   const { workflowId, shareId } = req.params;
-  const db = createServerSupabase();
 
-  const { data: wf } = await db
-    .from("workflows")
-    .select("id")
-    .eq("id", workflowId)
-    .eq("user_id", userId)
-    .single();
+  const wf = await prisma.workflow.findFirst({
+    where: { id: workflowId, userId },
+  });
   if (!wf) return void res.status(404).json({ detail: "Workflow not found" });
 
-  await db.from("workflow_shares").delete().eq("id", shareId).eq("workflow_id", workflowId);
+  await prisma.workflowShare.deleteMany({
+    where: { id: shareId, workflowId },
+  });
   res.status(204).send();
 }));
 
@@ -393,29 +374,28 @@ workflowsRouter.post("/:workflowId/share", requireAuth, asyncRoute(async (req, r
       .json({ detail: "You cannot share a workflow with yourself." });
   }
 
-  const db = createServerSupabase();
   // Verify ownership
-  const { data: wf } = await db
-    .from("workflows")
-    .select("id")
-    .eq("id", workflowId)
-    .eq("user_id", userId)
-    .eq("is_system", false)
-    .single();
+  const wf = await prisma.workflow.findFirst({
+    where: { id: workflowId, userId, isSystem: false },
+  });
   if (!wf) return void res.status(404).json({ detail: "Workflow not found or not editable" });
 
-  const rows = normalizedEmails.map((email: string) => ({
-    workflow_id: workflowId,
-    shared_by_user_id: userId,
-    shared_with_email: email,
-    allow_edit: allow_edit ?? false,
-  }));
-  // Upsert on (workflow_id, shared_with_email) so re-sharing to the same
-  // person updates the existing row instead of stacking duplicates.
-  const { error } = await db
-    .from("workflow_shares")
-    .upsert(rows, { onConflict: "workflow_id,shared_with_email" });
-  if (error) return void res.status(500).json({ detail: error.message });
+  for (const email of normalizedEmails) {
+    await prisma.workflowShare.upsert({
+      where: {
+        workflowId_sharedWithEmail: { workflowId, sharedWithEmail: email },
+      },
+      create: {
+        workflowId,
+        sharedByUserId: userId,
+        sharedWithEmail: email,
+        allowEdit: allow_edit ?? false,
+      },
+      update: {
+        allowEdit: allow_edit ?? false,
+      },
+    });
+  }
 
   res.status(204).send();
 }));

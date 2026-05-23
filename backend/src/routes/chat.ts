@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth";
-import { createServerSupabase } from "../lib/supabase";
+import { prisma } from "../lib/prisma";
 import {
     buildDocContext,
     buildMessages,
@@ -14,10 +14,10 @@ import { completeText } from "../lib/llm";
 import { getUserApiKeys, getUserModelSettings } from "../lib/userSettings";
 import { checkProjectAccess } from "../lib/access";
 import { logger } from "../lib/logger";
+import { auditLog } from "../lib/audit";
 
 export const chatRouter = Router();
 
-type Db = ReturnType<typeof createServerSupabase>;
 const isDev = process.env.NODE_ENV !== "production";
 const devLog = (msg: string, data?: Record<string, unknown>) => {
     if (isDev) logger.debug(data ?? {}, msg);
@@ -26,8 +26,8 @@ const devLog = (msg: string, data?: Record<string, unknown>) => {
 type AccessibleChat = {
     id: string;
     title: string | null;
-    user_id: string;
-    project_id: string | null;
+    userId: string;
+    projectId: string | null;
 } & Record<string, unknown>;
 
 function parseOptionalProjectId(value: unknown):
@@ -95,10 +95,9 @@ async function validateAccessibleProjectId(
     projectId: string | null,
     userId: string,
     userEmail: string | null | undefined,
-    db: Db,
 ): Promise<{ ok: true } | { ok: false; status: number; detail: string }> {
     if (!projectId) return { ok: true };
-    const access = await checkProjectAccess(projectId, userId, userEmail, db);
+    const access = await checkProjectAccess(projectId, userId, userEmail);
     if (!access.ok)
         return { ok: false, status: 404, detail: "Project not found" };
     return { ok: true };
@@ -108,24 +107,20 @@ async function getAccessibleChat(
     chatId: string,
     userId: string,
     userEmail: string | null | undefined,
-    db: Db,
 ): Promise<AccessibleChat | null> {
-    const { data: chat, error } = await db
-        .from("chats")
-        .select("*")
-        .eq("id", chatId)
-        .maybeSingle();
-    if (error || !chat) return null;
+    const chat = await prisma.chat.findUnique({
+        where: { id: chatId },
+    });
+    if (!chat) return null;
 
-    const row = chat as AccessibleChat;
-    if (row.user_id === userId) return row;
+    const row = chat as unknown as AccessibleChat;
+    if (row.userId === userId) return row;
 
-    if (row.project_id) {
+    if (row.projectId) {
         const access = await checkProjectAccess(
-            row.project_id,
+            row.projectId,
             userId,
             userEmail,
-            db,
         );
         if (access.ok) return row;
     }
@@ -141,37 +136,31 @@ async function getAccessibleChat(
 // listed per-project via GET /projects/:projectId/chats.
 chatRouter.get("/", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
-    const db = createServerSupabase();
     const requestedLimit = Number.parseInt(String(req.query.limit ?? ""), 10);
     const limit = Number.isFinite(requestedLimit)
         ? Math.min(Math.max(requestedLimit, 1), 100)
-        : null;
+        : undefined;
 
-    const { data: ownProjects, error: projErr } = await db
-        .from("projects")
-        .select("id")
-        .eq("user_id", userId);
-    if (projErr) return void res.status(500).json({ detail: projErr.message });
-    const ownProjectIds = ((ownProjects ?? []) as { id: string }[]).map(
-        (p) => p.id,
-    );
+    const ownProjects = await prisma.project.findMany({
+        where: { userId },
+        select: { id: true },
+    });
+    const ownProjectIds = ownProjects.map((p) => p.id);
 
-    const filter =
-        ownProjectIds.length > 0
-            ? `user_id.eq.${userId},project_id.in.(${ownProjectIds.join(",")})`
-            : `user_id.eq.${userId}`;
+    const chats = await prisma.chat.findMany({
+        where: {
+            OR: [
+                { userId },
+                ...(ownProjectIds.length > 0
+                    ? [{ projectId: { in: ownProjectIds } }]
+                    : []),
+            ],
+        },
+        orderBy: { createdAt: "desc" },
+        ...(limit ? { take: limit } : {}),
+    });
 
-    let query = db
-        .from("chats")
-        .select("*")
-        .or(filter)
-        .order("created_at", { ascending: false });
-
-    if (limit) query = query.limit(limit);
-
-    const { data, error } = await query;
-    if (error) return void res.status(500).json({ detail: error.message });
-    res.json(data ?? []);
+    res.json(chats);
 });
 
 // POST /chat/create
@@ -183,26 +172,29 @@ chatRouter.post("/create", requireAuth, async (req, res) => {
         return void res.status(400).json({ detail: parsedProjectId.detail });
     }
     const projectId = parsedProjectId.projectId;
-    const db = createServerSupabase();
     const projectAccess = await validateAccessibleProjectId(
         projectId,
         userId,
         userEmail,
-        db,
     );
     if (!projectAccess.ok)
         return void res
             .status(projectAccess.status)
             .json({ detail: projectAccess.detail });
 
-    const { data, error } = await db
-        .from("chats")
-        .insert({ user_id: userId, project_id: projectId ?? null })
-        .select("id")
-        .single();
+    const chat = await prisma.chat.create({
+        data: { userId, projectId: projectId ?? null },
+        select: { id: true },
+    });
 
-    if (error) return void res.status(500).json({ detail: error.message });
-    res.json({ id: data.id });
+    await auditLog({
+        userId,
+        action: "create",
+        entity: "chat",
+        entityId: chat.id,
+    });
+
+    res.json({ id: chat.id });
 });
 
 // GET /chat/:chatId
@@ -210,19 +202,17 @@ chatRouter.get("/:chatId", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
     const { chatId } = req.params;
-    const db = createServerSupabase();
 
-    const chat = await getAccessibleChat(chatId, userId, userEmail, db);
+    const chat = await getAccessibleChat(chatId, userId, userEmail);
     if (!chat)
         return void res.status(404).json({ detail: "Chat not found" });
 
-    const { data: messages } = await db
-        .from("chat_messages")
-        .select("*")
-        .eq("chat_id", chatId)
-        .order("created_at", { ascending: true });
+    const messages = await prisma.chatMessage.findMany({
+        where: { chatId },
+        orderBy: { createdAt: "asc" },
+    });
 
-    const hydrated = await hydrateEditStatuses(messages ?? [], db);
+    const hydrated = await hydrateEditStatuses(messages as unknown as Record<string, unknown>[]);
     res.json({ chat, messages: hydrated });
 });
 
@@ -233,7 +223,6 @@ chatRouter.get("/:chatId", requireAuth, async (req, res) => {
 // EditCards render with the real state.
 async function hydrateEditStatuses(
     messages: Record<string, unknown>[],
-    db: ReturnType<typeof createServerSupabase>,
 ): Promise<Record<string, unknown>[]> {
     const editIds = new Set<string>();
     const versionIds = new Set<string>();
@@ -263,11 +252,11 @@ async function hydrateEditStatuses(
     // Edit status patch.
     const statusById = new Map<string, "pending" | "accepted" | "rejected">();
     if (editIds.size > 0) {
-        const { data: rows } = await db
-            .from("document_edits")
-            .select("id, status")
-            .in("id", Array.from(editIds));
-        for (const r of (rows ?? []) as { id: string; status: string }[]) {
+        const rows = await prisma.documentEdit.findMany({
+            where: { id: { in: Array.from(editIds) } },
+            select: { id: true, status: true },
+        });
+        for (const r of rows) {
             if (
                 r.status === "pending" ||
                 r.status === "accepted" ||
@@ -283,15 +272,12 @@ async function hydrateEditStatuses(
     // document_versions so the UI can render "V3" chips + download filenames.
     const versionNumberById = new Map<string, number | null>();
     if (versionIds.size > 0) {
-        const { data: vrows } = await db
-            .from("document_versions")
-            .select("id, version_number")
-            .in("id", Array.from(versionIds));
-        for (const r of (vrows ?? []) as {
-            id: string;
-            version_number: number | null;
-        }[]) {
-            versionNumberById.set(r.id, r.version_number ?? null);
+        const vrows = await prisma.documentVersion.findMany({
+            where: { id: { in: Array.from(versionIds) } },
+            select: { id: true, versionNumber: true },
+        });
+        for (const r of vrows) {
+            versionNumberById.set(r.id, r.versionNumber ?? null);
         }
     }
 
@@ -351,17 +337,19 @@ chatRouter.patch("/:chatId", requireAuth, async (req, res) => {
     if (!title)
         return void res.status(400).json({ detail: "title is required" });
 
-    const db = createServerSupabase();
-    const { data, error } = await db
-        .from("chats")
-        .update({ title })
-        .eq("id", chatId)
-        .eq("user_id", userId)
-        .select("id, title")
-        .single();
-
-    if (error || !data)
+    // Only the chat owner can rename
+    const existing = await prisma.chat.findFirst({
+        where: { id: chatId, userId },
+    });
+    if (!existing)
         return void res.status(404).json({ detail: "Chat not found" });
+
+    const data = await prisma.chat.update({
+        where: { id: chatId },
+        data: { title },
+        select: { id: true, title: true },
+    });
+
     res.json(data);
 });
 
@@ -369,14 +357,22 @@ chatRouter.patch("/:chatId", requireAuth, async (req, res) => {
 chatRouter.delete("/:chatId", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const { chatId } = req.params;
-    const db = createServerSupabase();
-    const { error } = await db
-        .from("chats")
-        .delete()
-        .eq("id", chatId)
-        .eq("user_id", userId);
 
-    if (error) return void res.status(500).json({ detail: error.message });
+    const existing = await prisma.chat.findFirst({
+        where: { id: chatId, userId },
+    });
+    if (!existing)
+        return void res.status(404).json({ detail: "Chat not found" });
+
+    await prisma.chat.delete({ where: { id: chatId } });
+
+    await auditLog({
+        userId,
+        action: "delete",
+        entity: "chat",
+        entityId: chatId,
+    });
+
     res.status(204).send();
 });
 
@@ -390,16 +386,12 @@ chatRouter.post("/:chatId/generate-title", requireAuth, async (req, res) => {
     if (!message)
         return void res.status(400).json({ detail: "message is required" });
 
-    const db = createServerSupabase();
-    const chat = await getAccessibleChat(chatId, userId, userEmail, db);
+    const chat = await getAccessibleChat(chatId, userId, userEmail);
     if (!chat)
         return void res.status(404).json({ detail: "Chat not found" });
 
     try {
-        const { title_model, api_keys } = await getUserModelSettings(
-            userId,
-            db,
-        );
+        const { title_model, api_keys } = await getUserModelSettings(userId);
         const titleText = await completeText({
             model: title_model,
             user: `Generate a concise title (3–6 words) for a chat in an AI Legal Platform that starts with this message. The title should describe the topic or document — do NOT include words like "Legal Assistant", "AI", "Chat", or any similar prefix. Return only the title, no quotes or punctuation.\n\nMessage: ${message.slice(0, 500)}`,
@@ -408,10 +400,10 @@ chatRouter.post("/:chatId/generate-title", requireAuth, async (req, res) => {
         });
         const title = titleText.trim() || message.slice(0, 60);
 
-        await db
-            .from("chats")
-            .update({ title })
-            .eq("id", chatId);
+        await prisma.chat.update({
+            where: { id: chatId },
+            data: { title },
+        });
 
         res.json({ title });
     } catch (err) {
@@ -458,17 +450,16 @@ chatRouter.post("/", requireAuth, async (req, res) => {
     });
 
     const userEmail = res.locals.userEmail as string | undefined;
-    const db = createServerSupabase();
     let chatId = chat_id ?? null;
     let chatTitle: string | null = null;
     let resolvedProjectId: string | null = parsedProjectId.projectId;
 
     if (chatId) {
-        const existing = await getAccessibleChat(chatId, userId, userEmail, db);
+        const existing = await getAccessibleChat(chatId, userId, userEmail);
         if (!existing)
             return void res.status(404).json({ detail: "Chat not found" });
 
-        const existingProjectId = existing.project_id ?? null;
+        const existingProjectId = existing.projectId ?? null;
         if (
             parsedProjectId.provided &&
             parsedProjectId.projectId !== existingProjectId
@@ -488,25 +479,17 @@ chatRouter.post("/", requireAuth, async (req, res) => {
             resolvedProjectId,
             userId,
             userEmail,
-            db,
         );
         if (!projectAccess.ok)
             return void res
                 .status(projectAccess.status)
                 .json({ detail: projectAccess.detail });
 
-        const { data: newChat, error } = await db
-            .from("chats")
-            .insert({ user_id: userId, project_id: resolvedProjectId })
-            .select("id, title")
-            .single();
-        if (error || !newChat) {
-            logger.error({ err: error }, "[chat/stream] failed to create chat");
-            return void res
-                .status(500)
-                .json({ detail: "Failed to create chat" });
-        }
-        chatId = newChat.id as string;
+        const newChat = await prisma.chat.create({
+            data: { userId, projectId: resolvedProjectId },
+            select: { id: true, title: true },
+        });
+        chatId = newChat.id;
         chatTitle = newChat.title;
     }
 
@@ -514,19 +497,19 @@ chatRouter.post("/", requireAuth, async (req, res) => {
 
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
     if (lastUser) {
-        await db.from("chat_messages").insert({
-            chat_id: chatId,
-            role: "user",
-            content: lastUser.content,
-            files: lastUser.files ?? null,
-            workflow: lastUser.workflow ?? null,
+        await prisma.chatMessage.create({
+            data: {
+                chatId,
+                role: "user",
+                content: lastUser.content ?? undefined,
+                files: (lastUser.files as any) ?? undefined,
+            },
         });
     }
 
     const { docIndex, docStore } = await buildDocContext(
         messages,
         userId,
-        db,
         chatId,
     );
     const docAvailability = Object.entries(docIndex).map(([doc_id, info]) => ({
@@ -536,12 +519,11 @@ chatRouter.post("/", requireAuth, async (req, res) => {
     const enrichedMessages = await enrichWithPriorEvents(
         messages,
         chatId,
-        db,
         docIndex,
     );
     const apiMessages = buildMessages(enrichedMessages, docAvailability);
 
-    const workflowStore = await buildWorkflowStore(userId, userEmail, db);
+    const workflowStore = await buildWorkflowStore(userId, userEmail);
 
     devLog("[chat/stream] starting LLM stream", {
         apiMessageCount: apiMessages.length,
@@ -557,7 +539,7 @@ chatRouter.post("/", requireAuth, async (req, res) => {
 
     const write = (line: string) => res.write(line);
 
-    const apiKeys = await getUserApiKeys(userId, db);
+    const apiKeys = await getUserApiKeys(userId);
 
     try {
         write(`data: ${JSON.stringify({ type: "chat_id", chatId })}\n\n`);
@@ -567,7 +549,6 @@ chatRouter.post("/", requireAuth, async (req, res) => {
             docStore,
             docIndex,
             userId,
-            db,
             write,
             workflowStore,
             model,
@@ -581,18 +562,20 @@ chatRouter.post("/", requireAuth, async (req, res) => {
         });
 
         const annotations = extractAnnotations(fullText, docIndex, events);
-        await db.from("chat_messages").insert({
-            chat_id: chatId,
-            role: "assistant",
-            content: events.length ? events : null,
-            annotations: annotations.length ? annotations : null,
+        await prisma.chatMessage.create({
+            data: {
+                chatId,
+                role: "assistant",
+                content: events.length ? (events as any) : undefined,
+                annotations: annotations.length ? (annotations as any) : undefined,
+            },
         });
 
         if (!chatTitle && lastUser?.content) {
-            await db
-                .from("chats")
-                .update({ title: lastUser.content.slice(0, 120) })
-                .eq("id", chatId);
+            await prisma.chat.update({
+                where: { id: chatId },
+                data: { title: lastUser.content.slice(0, 120) },
+            });
         }
     } catch (err) {
         logger.error({ err }, "[chat/stream] error");

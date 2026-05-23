@@ -7,7 +7,7 @@ import {
     uploadFile,
 } from "./storage";
 import { convertedPdfKey } from "./convert";
-import { createServerSupabase } from "./supabase";
+import { prisma } from "./prisma";
 import {
     applyTrackedEdits,
     extractDocxBodyText,
@@ -545,19 +545,17 @@ function citationReminder(docLabel: string, filename: string): string {
 export async function enrichWithPriorEvents(
     messages: ChatMessage[],
     chatId: string | null | undefined,
-    db: ReturnType<typeof createServerSupabase>,
     docIndex: DocIndex,
 ): Promise<ChatMessage[]> {
     if (!chatId) return messages;
-    const { data: rows } = await db
-        .from("chat_messages")
-        .select("content, created_at")
-        .eq("chat_id", chatId)
-        .eq("role", "assistant")
-        .order("created_at", { ascending: false })
-        .limit(1);
+    const rows = await prisma.chatMessage.findMany({
+        where: { chatId, role: "assistant" },
+        select: { content: true, createdAt: true },
+        orderBy: { createdAt: "desc" },
+        take: 1,
+    });
 
-    const lastRow = rows?.[0] as { content?: unknown } | undefined;
+    const lastRow = rows[0] as { content?: unknown } | undefined;
     const content = lastRow?.content;
     if (!Array.isArray(content)) return messages;
 
@@ -732,7 +730,6 @@ export async function generateDocx(
     title: string,
     sections: unknown[],
     userId: string,
-    db: ReturnType<typeof createServerSupabase>,
     options?: { landscape?: boolean; projectId?: string | null },
 ) {
     try {
@@ -1188,47 +1185,35 @@ export async function generateDocx(
         // project chats we attach to the project so it appears in the
         // sidebar; in the general chat we leave project_id null and it
         // stays a standalone document.
-        const { data: docRow, error: docErr } = await db
-            .from("documents")
-            .insert({
-                project_id: options?.projectId ?? null,
-                user_id: userId,
+        const docRow = await prisma.document.create({
+            data: {
+                projectId: options?.projectId ?? null,
+                userId,
                 filename,
-                file_type: "docx",
-                size_bytes: buf.byteLength,
+                fileType: "docx",
+                sizeBytes: buf.byteLength,
                 status: "ready",
-            })
-            .select("id")
-            .single();
-        if (docErr || !docRow) {
-            return {
-                error: `Failed to record generated document: ${docErr?.message ?? "unknown"}`,
-            };
-        }
-        const documentId = docRow.id as string;
+            },
+            select: { id: true },
+        });
+        const documentId = docRow.id;
 
-        const { data: versionRow, error: verErr } = await db
-            .from("document_versions")
-            .insert({
-                document_id: documentId,
-                storage_path: key,
+        const versionRow = await prisma.documentVersion.create({
+            data: {
+                documentId,
+                storagePath: key,
                 source: "generated",
-                version_number: 1,
-                display_name: filename,
-            })
-            .select("id")
-            .single();
-        if (verErr || !versionRow) {
-            return {
-                error: `Failed to record generated document version: ${verErr?.message ?? "unknown"}`,
-            };
-        }
-        const versionId = versionRow.id as string;
+                versionNumber: 1,
+                displayName: filename,
+            },
+            select: { id: true },
+        });
+        const versionId = versionRow.id;
 
-        await db
-            .from("documents")
-            .update({ current_version_id: versionId })
-            .eq("id", documentId);
+        await prisma.document.update({
+            where: { id: documentId },
+            data: { currentVersionId: versionId },
+        });
 
         return {
             filename,
@@ -1254,9 +1239,8 @@ export async function generateDocx(
  */
 export async function loadCurrentVersionBytes(
     documentId: string,
-    db: ReturnType<typeof createServerSupabase>,
 ): Promise<{ bytes: Buffer; storage_path: string } | null> {
-    const active = await loadActiveVersion(documentId, db);
+    const active = await loadActiveVersion(documentId);
     if (!active) return null;
     const raw = await downloadFile(active.storage_path);
     if (!raw) return null;
@@ -1272,7 +1256,6 @@ export async function runEditDocument(params: {
     documentId: string;
     userId: string;
     edits: EditInput[];
-    db: ReturnType<typeof createServerSupabase>;
     /**
      * If provided, append these edits to the existing turn-scoped version
      * (overwrites the file at storagePath and reuses the document_versions
@@ -1297,16 +1280,15 @@ export async function runEditDocument(params: {
       }
     | { ok: false; error: string }
 > {
-    const { documentId, userId, edits, db, reuseVersion } = params;
+    const { documentId, userId, edits, reuseVersion } = params;
 
-    const { data: doc } = await db
-        .from("documents")
-        .select("id, filename")
-        .eq("id", documentId)
-        .single();
+    const doc = await prisma.document.findUnique({
+        where: { id: documentId },
+        select: { id: true, filename: true },
+    });
     if (!doc) return { ok: false, error: "Document not found." };
 
-    const current = await loadCurrentVersionBytes(documentId, db);
+    const current = await loadCurrentVersionBytes(documentId);
     if (!current) return { ok: false, error: "Could not load document bytes." };
 
     const {
@@ -1356,104 +1338,95 @@ export async function runEditDocument(params: {
         // Per-document sequential number for the new assistant_edit
         // version. The counter spans upload + user_upload + assistant_edit
         // so the original upload is V1 and the first assistant edit is V2.
-        const { data: maxRow } = await db
-            .from("document_versions")
-            .select("version_number")
-            .eq("document_id", documentId)
-            .in("source", ["upload", "user_upload", "assistant_edit"])
-            .order("version_number", { ascending: false, nullsFirst: false })
-            .limit(1)
-            .maybeSingle();
+        const maxRow = await prisma.documentVersion.findFirst({
+            where: {
+                documentId,
+                source: { in: ["upload", "user_upload", "assistant_edit"] },
+            },
+            orderBy: { versionNumber: "desc" },
+            select: { versionNumber: true },
+        });
         nextVersionNumber =
-            ((maxRow?.version_number as number | null) ?? 1) + 1;
+            ((maxRow?.versionNumber as number | null) ?? 1) + 1;
 
         // Inherit the display name from the most recent prior version so
-        // user-applied renames carry forward through further edits. Falls
-        // back to the parent document's filename when no prior version has
-        // a display name (e.g. the first assistant edit of a pre-existing
-        // doc). We intentionally do NOT append "[Edited Vn]" — the version
-        // number is surfaced separately as a tag in the UI.
-        const { data: prevRow } = await db
-            .from("document_versions")
-            .select("display_name, created_at")
-            .eq("document_id", documentId)
-            .order("created_at", { ascending: false })
-            .limit(1)
-            .maybeSingle();
+        // user-applied renames carry forward through further edits.
+        const prevRow = await prisma.documentVersion.findFirst({
+            where: { documentId },
+            orderBy: { createdAt: "desc" },
+            select: { displayName: true },
+        });
         const inheritedDisplayName =
-            (prevRow?.display_name as string | null) ??
-            (doc.filename as string | null) ??
+            prevRow?.displayName ??
+            doc.filename ??
             null;
 
-        const { data: versionRow, error: verErr } = await db
-            .from("document_versions")
-            .insert({
-                document_id: documentId,
-                storage_path: newPath,
+        const versionRow = await prisma.documentVersion.create({
+            data: {
+                documentId,
+                storagePath: newPath,
                 source: "assistant_edit",
-                version_number: nextVersionNumber,
-                display_name: inheritedDisplayName,
-            })
-            .select("id")
-            .single();
-        if (verErr || !versionRow) {
-            return { ok: false, error: "Failed to record document version." };
-        }
-        versionRowId = versionRow.id as string;
+                versionNumber: nextVersionNumber,
+                displayName: inheritedDisplayName,
+            },
+            select: { id: true },
+        });
+        versionRowId = versionRow.id;
     }
 
     // Insert one row per change
     const editRows = changes.map((c) => ({
-        document_id: documentId,
-        version_id: versionRowId,
-        change_id: c.id,
-        del_w_id: c.delId ?? null,
-        ins_w_id: c.insId ?? null,
-        deleted_text: c.deletedText,
-        inserted_text: c.insertedText,
-        context_before: c.contextBefore ?? "",
-        context_after: c.contextAfter ?? "",
+        documentId,
+        versionId: versionRowId,
+        changeId: c.id,
+        delWId: c.delId ?? null,
+        insWId: c.insId ?? null,
+        deletedText: c.deletedText,
+        insertedText: c.insertedText,
+        contextBefore: c.contextBefore ?? "",
+        contextAfter: c.contextAfter ?? "",
         status: "pending" as const,
     }));
-    const { data: insertedEdits, error: editsErr } = await db
-        .from("document_edits")
-        .insert(editRows)
-        .select(
-            "id, change_id, del_w_id, ins_w_id, deleted_text, inserted_text, context_before, context_after",
-        );
-
-    if (editsErr || !insertedEdits) {
-        return { ok: false, error: "Failed to record edits." };
+    // createMany doesn't return rows, so we insert individually for the IDs
+    const insertedEdits = [];
+    for (const row of editRows) {
+        const inserted = await prisma.documentEdit.create({
+            data: row,
+            select: {
+                id: true,
+                changeId: true,
+                delWId: true,
+                insWId: true,
+                deletedText: true,
+                insertedText: true,
+                contextBefore: true,
+                contextAfter: true,
+            },
+        });
+        insertedEdits.push(inserted);
     }
 
-    await db
-        .from("documents")
-        .update({ current_version_id: versionRowId })
-        .eq("id", documentId);
+    await prisma.document.update({
+        where: { id: documentId },
+        data: { currentVersionId: versionRowId },
+    });
 
     const annotations: EditAnnotation[] = insertedEdits.map(
-        (r: {
-            id: string;
-            change_id: string;
-            deleted_text: string;
-            inserted_text: string;
-            context_before: string | null;
-            context_after: string | null;
-        }) => {
-            const src = changes.find((c) => c.id === r.change_id);
+        (r) => {
+            const src = changes.find((c) => c.id === r.changeId);
             return {
                 kind: "edit",
                 edit_id: r.id,
                 document_id: documentId,
                 version_id: versionRowId,
                 version_number: nextVersionNumber,
-                change_id: r.change_id,
+                change_id: r.changeId,
                 del_w_id: src?.delId,
                 ins_w_id: src?.insId,
-                deleted_text: r.deleted_text ?? "",
-                inserted_text: r.inserted_text ?? "",
-                context_before: r.context_before ?? "",
-                context_after: r.context_after ?? "",
+                deleted_text: r.deletedText ?? "",
+                inserted_text: r.insertedText ?? "",
+                context_before: r.contextBefore ?? "",
+                context_after: r.contextAfter ?? "",
                 reason: src?.reason,
                 status: "pending",
             };
@@ -1484,7 +1457,6 @@ async function readDocumentContent(
     docStore: DocStore,
     write: (s: string) => void,
     docIndex?: DocIndex,
-    db?: ReturnType<typeof createServerSupabase>,
     opts?: { emitEvents?: boolean },
 ): Promise<string> {
     const emitEvents = opts?.emitEvents ?? true;
@@ -1525,8 +1497,8 @@ async function readDocumentContent(
         // reflects accepted/pending edits rather than the original upload.
         let raw: ArrayBuffer | null = null;
         let sourcePath = docInfo.storage_path;
-        if (documentId && db) {
-            const current = await loadCurrentVersionBytes(documentId, db);
+        if (documentId) {
+            const current = await loadCurrentVersionBytes(documentId);
             if (current) {
                 raw = current.bytes.buffer.slice(
                     current.bytes.byteOffset,
@@ -1670,7 +1642,6 @@ async function findInDocumentContent(params: {
     docStore: DocStore;
     write: (s: string) => void;
     docIndex?: DocIndex;
-    db?: ReturnType<typeof createServerSupabase>;
 }): Promise<string> {
     const {
         docLabel,
@@ -1680,7 +1651,6 @@ async function findInDocumentContent(params: {
         docStore,
         write,
         docIndex,
-        db,
     } = params;
 
     if (!query || !query.trim()) {
@@ -1711,7 +1681,6 @@ async function findInDocumentContent(params: {
         docStore,
         write,
         docIndex,
-        db,
         { emitEvents: false },
     );
     if (!text || text === "Document could not be read.") {
@@ -1839,7 +1808,6 @@ export async function runToolCalls(
     toolCalls: ToolCall[],
     docStore: DocStore,
     userId: string,
-    db: ReturnType<typeof createServerSupabase>,
     write: (s: string) => void,
     workflowStore?: WorkflowStore,
     tabularStore?: TabularCellStore,
@@ -1884,7 +1852,6 @@ export async function runToolCalls(
                 docStore,
                 write,
                 docIndex,
-                db,
             );
             const filename = docStore.get(docId)?.filename;
             const documentId = docIndex?.[docId]?.document_id;
@@ -1917,7 +1884,6 @@ export async function runToolCalls(
                 docStore,
                 write,
                 docIndex,
-                db,
             });
             const filename = docStore.get(docId)?.filename;
             if (filename) {
@@ -1962,7 +1928,6 @@ export async function runToolCalls(
                     docStore,
                     write,
                     docIndex,
-                    db,
                 );
                 const filename = docStore.get(docId)?.filename ?? docId;
                 parts.push(
@@ -2138,7 +2103,6 @@ export async function runToolCalls(
                     documentId: indexed.document_id,
                     userId,
                     edits,
-                    db,
                     reuseVersion,
                 });
 
@@ -2268,7 +2232,6 @@ export async function runToolCalls(
                     // changes rolled in), no point re-fetching per copy.
                     const active = await loadActiveVersion(
                         sourceIndexed.document_id,
-                        db,
                     );
                     const sourcePath =
                         active?.storage_path ?? sourceInfo.storage_path;
@@ -2310,36 +2273,26 @@ export async function runToolCalls(
                             filenames.push(`${baseStem}${suffix}${srcExt}`);
                         }
 
-                        // Bulk insert N documents in one round-trip.
-                        const docRows = filenames.map((fn) => ({
-                            project_id: projectId,
-                            user_id: userId,
-                            filename: fn,
-                            file_type: sourceInfo.file_type,
-                            size_bytes: raw.byteLength,
-                            status: "ready",
-                        }));
-                        const { data: insertedDocs, error: docErr } = await db
-                            .from("documents")
-                            .insert(docRows)
-                            .select("id, filename");
-                        if (
-                            docErr ||
-                            !insertedDocs ||
-                            insertedDocs.length === 0
-                        ) {
-                            fail(
-                                `Failed to record replicated documents: ${docErr?.message ?? "unknown"}`,
-                            );
+                        // Insert N documents — Prisma createMany doesn't return rows,
+                        // so we insert one by one to get IDs.
+                        const newDocs: { id: string; filename: string }[] = [];
+                        for (const fn of filenames) {
+                            const d = await prisma.document.create({
+                                data: {
+                                    projectId: projectId ?? undefined,
+                                    userId,
+                                    filename: fn,
+                                    fileType: sourceInfo.file_type,
+                                    sizeBytes: raw.byteLength,
+                                    status: "ready",
+                                },
+                                select: { id: true, filename: true },
+                            });
+                            newDocs.push(d);
+                        }
+                        if (newDocs.length === 0) {
+                            fail("Failed to record replicated documents");
                         } else {
-                            // Preserve the request order so each row pairs
-                            // with the right filename. Supabase returns
-                            // inserted rows in the same order as the
-                            // payload.
-                            const newDocs = insertedDocs as {
-                                id: string;
-                                filename: string;
-                            }[];
                             const contentType =
                                 sourceInfo.file_type === "pdf"
                                     ? "application/pdf"
@@ -2379,53 +2332,37 @@ export async function runToolCalls(
                             }
                             await Promise.all(uploadJobs);
 
-                            // Bulk insert N versions in one round-trip.
-                            const versionRows = newDocs.map((d, idx) => ({
-                                document_id: d.id,
-                                storage_path: newKeys[idx],
-                                pdf_storage_path: newPdfKeys[idx],
-                                source: "upload",
-                                version_number: 1,
-                                display_name: d.filename,
-                            }));
-                            const { data: insertedVersions, error: verErr } =
-                                await db
-                                    .from("document_versions")
-                                    .insert(versionRows)
-                                    .select("id, document_id");
-                            if (
-                                verErr ||
-                                !insertedVersions ||
-                                insertedVersions.length !== newDocs.length
-                            ) {
-                                fail(
-                                    `Failed to record replicated document versions: ${verErr?.message ?? "unknown"}`,
-                                );
-                            } else {
-                                const versionByDocId = new Map<
-                                    string,
-                                    string
-                                >();
-                                for (const v of insertedVersions as {
-                                    id: string;
-                                    document_id: string;
-                                }[]) {
-                                    versionByDocId.set(v.document_id, v.id);
-                                }
+                            // Insert N versions — need IDs back.
+                            const versionByDocId = new Map<string, string>();
+                            for (let idx = 0; idx < newDocs.length; idx++) {
+                                const d = newDocs[idx];
+                                const v = await prisma.documentVersion.create({
+                                    data: {
+                                        documentId: d.id,
+                                        storagePath: newKeys[idx],
+                                        pdfStoragePath: newPdfKeys[idx],
+                                        source: "upload",
+                                        versionNumber: 1,
+                                        displayName: d.filename,
+                                    },
+                                    select: { id: true, documentId: true },
+                                });
+                                versionByDocId.set(v.documentId, v.id);
+                            }
 
-                                // current_version_id has to be a per-row
-                                // value, so a single UPDATE statement
-                                // can't cover all N. Fan out in parallel
-                                // instead of sequential awaits.
+                            if (versionByDocId.size !== newDocs.length) {
+                                fail("Failed to record replicated document versions");
+                            } else {
+                                // Update current_version_id for each doc
                                 await Promise.all(
                                     newDocs.map((d) =>
-                                        db
-                                            .from("documents")
-                                            .update({
-                                                current_version_id:
+                                        prisma.document.update({
+                                            where: { id: d.id },
+                                            data: {
+                                                currentVersionId:
                                                     versionByDocId.get(d.id),
-                                            })
-                                            .eq("id", d.id),
+                                            },
+                                        }),
                                     ),
                                 );
 
@@ -2535,7 +2472,6 @@ export async function runToolCalls(
                 title,
                 args.sections as unknown[],
                 userId,
-                db,
                 { landscape, projectId: projectId ?? null },
             );
             let newDocLabel: string | null = null;
@@ -2716,7 +2652,6 @@ export async function runLLMStream(params: {
     docStore: DocStore;
     docIndex: DocIndex;
     userId: string;
-    db: ReturnType<typeof createServerSupabase>;
     write: (s: string) => void;
     extraTools?: unknown[];
     workflowStore?: WorkflowStore;
@@ -2736,7 +2671,6 @@ export async function runLLMStream(params: {
         docStore,
         docIndex,
         userId,
-        db,
         write,
         extraTools,
         workflowStore,
@@ -2900,7 +2834,6 @@ export async function runLLMStream(params: {
                 toolCalls,
                 docStore,
                 userId,
-                db,
                 write,
                 workflowStore,
                 tabularStore,
@@ -3050,7 +2983,6 @@ export function extractAnnotations(
 export async function buildDocContext(
     messages: ChatMessage[],
     userId: string,
-    db: ReturnType<typeof createServerSupabase>,
     chatId?: string | null,
 ): Promise<{ docIndex: DocIndex; docStore: DocStore }> {
     const docIndex: DocIndex = {};
@@ -3070,12 +3002,11 @@ export async function buildDocContext(
     // the model loses access to generated docs after the turn that created
     // them, and can't call edit_document / read_document on them.
     if (chatId) {
-        const { data: rows } = await db
-            .from("chat_messages")
-            .select("content")
-            .eq("chat_id", chatId)
-            .eq("role", "assistant");
-        for (const row of rows ?? []) {
+        const rows = await prisma.chatMessage.findMany({
+            where: { chatId, role: "assistant" },
+            select: { content: true },
+        });
+        for (const row of rows) {
             const content = (row as { content?: unknown }).content;
             if (!Array.isArray(content)) continue;
             for (const ev of content as Record<string, unknown>[]) {
@@ -3091,12 +3022,20 @@ export async function buildDocContext(
 
     const ids = [...documentIds];
     if (ids.length > 0) {
-        const { data: docs } = await db
-            .from("documents")
-            .select("id, filename, file_type, current_version_id, status")
-            .in("id", ids)
-            .eq("user_id", userId)
-            .eq("status", "ready");
+        const docs = await prisma.document.findMany({
+            where: {
+                id: { in: ids },
+                userId,
+                status: "ready",
+            },
+            select: {
+                id: true,
+                filename: true,
+                fileType: true,
+                currentVersionId: true,
+                status: true,
+            },
+        });
 
         const docList = (docs ?? []) as unknown as {
             id: string;
@@ -3106,7 +3045,7 @@ export async function buildDocContext(
             active_version_number?: number | null;
             storage_path?: string | null;
         }[];
-        await attachActiveVersionPaths(db, docList);
+        await attachActiveVersionPaths(docList);
         for (let i = 0; i < docList.length; i++) {
             const doc = docList[i];
             if (!doc.storage_path) continue;
@@ -3139,7 +3078,6 @@ export async function buildDocContext(
 export async function buildProjectDocContext(
     projectId: string,
     _userId: string,
-    db: ReturnType<typeof createServerSupabase>,
 ): Promise<{
     docIndex: DocIndex;
     docStore: DocStore;
@@ -3148,19 +3086,23 @@ export async function buildProjectDocContext(
     const docIndex: DocIndex = {};
     const docStore: DocStore = new Map();
 
-    const [{ data: docs }, { data: folders }] = await Promise.all([
-        db
-            .from("documents")
-            .select(
-                "id, filename, file_type, current_version_id, status, folder_id",
-            )
-            .eq("project_id", projectId)
-            .eq("status", "ready")
-            .order("created_at", { ascending: true }),
-        db
-            .from("project_subfolders")
-            .select("id, name, parent_folder_id")
-            .eq("project_id", projectId),
+    const [docs, folders] = await Promise.all([
+        prisma.document.findMany({
+            where: { projectId, status: "ready" },
+            select: {
+                id: true,
+                filename: true,
+                fileType: true,
+                currentVersionId: true,
+                status: true,
+                folderId: true,
+            },
+            orderBy: { createdAt: "asc" },
+        }),
+        prisma.projectSubfolder.findMany({
+            where: { projectId },
+            select: { id: true, name: true, parentFolderId: true },
+        }),
     ]);
     const docList = (docs ?? []) as unknown as {
         id: string;
@@ -3171,7 +3113,7 @@ export async function buildProjectDocContext(
         folder_id?: string | null;
         storage_path?: string | null;
     }[];
-    await attachActiveVersionPaths(db, docList);
+    await attachActiveVersionPaths(docList);
 
     // Build folder id → full path map
     const folderMap = new Map<
@@ -3181,7 +3123,7 @@ export async function buildProjectDocContext(
     for (const f of folders ?? [])
         folderMap.set(f.id, {
             name: f.name,
-            parent_folder_id: f.parent_folder_id,
+            parent_folder_id: f.parentFolderId,
         });
 
     function resolvePath(folderId: string | null): string {
@@ -3233,7 +3175,6 @@ export async function buildProjectDocContext(
 export async function buildWorkflowStore(
     userId: string,
     userEmail: string | null | undefined,
-    db: ReturnType<typeof createServerSupabase>,
 ): Promise<WorkflowStore> {
     const { BUILTIN_WORKFLOWS } = await import("./builtinWorkflows");
     const store: WorkflowStore = new Map();
@@ -3245,37 +3186,35 @@ export async function buildWorkflowStore(
     }
 
     // Then overlay user-owned assistant workflows.
-    const { data: workflows } = await db
-        .from("workflows")
-        .select("id, title, prompt_md")
-        .eq("user_id", userId)
-        .eq("type", "assistant");
-    for (const wf of workflows ?? []) {
-        if (wf.prompt_md) {
-            store.set(wf.id, { title: wf.title, prompt_md: wf.prompt_md });
+    const workflows = await prisma.workflow.findMany({
+        where: { userId, type: "assistant" },
+        select: { id: true, title: true, promptMd: true },
+    });
+    for (const wf of workflows) {
+        if (wf.promptMd) {
+            store.set(wf.id, { title: wf.title, prompt_md: wf.promptMd });
         }
     }
 
     // Shared assistant workflows must also be readable by workflow tools.
     if (normalizedUserEmail) {
-        const { data: shares } = await db
-            .from("workflow_shares")
-            .select("workflow_id")
-            .eq("shared_with_email", normalizedUserEmail);
+        const shares = await prisma.workflowShare.findMany({
+            where: { sharedWithEmail: normalizedUserEmail },
+            select: { workflowId: true },
+        });
         const sharedIds = [
-            ...new Set((shares ?? []).map((share) => share.workflow_id)),
+            ...new Set(shares.map((share) => share.workflowId)),
         ];
         if (sharedIds.length > 0) {
-            const { data: sharedWorkflows } = await db
-                .from("workflows")
-                .select("id, title, prompt_md")
-                .in("id", sharedIds)
-                .eq("type", "assistant");
-            for (const wf of sharedWorkflows ?? []) {
-                if (wf.prompt_md) {
+            const sharedWorkflows = await prisma.workflow.findMany({
+                where: { id: { in: sharedIds }, type: "assistant" },
+                select: { id: true, title: true, promptMd: true },
+            });
+            for (const wf of sharedWorkflows) {
+                if (wf.promptMd) {
                     store.set(wf.id, {
                         title: wf.title,
-                        prompt_md: wf.prompt_md,
+                        prompt_md: wf.promptMd,
                     });
                 }
             }
