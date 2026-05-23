@@ -44,5 +44,8 @@
     "tsx": "^4.19.3",
     "typescript": "^5.8.3"
   },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
   "license": "AGPL-3.0-only"
 }
