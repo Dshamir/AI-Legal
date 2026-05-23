@@ -115,10 +115,42 @@ Open `http://localhost:3000`.
 
 **DOC or DOCX conversion fails.** Install LibreOffice locally and restart the backend so document conversion commands are available on the process path.
 
+## Docker Setup (Self-Hosted)
+
+Copy and configure environment:
+
+```bash
+cp .env.example .env
+# Edit .env with your API keys and secrets
+```
+
+Start all services:
+
+```bash
+./ailegal.sh up
+```
+
+Open `http://localhost` in your browser.
+
+### Common Commands
+
+```bash
+./ailegal.sh health          # Check all services
+./ailegal.sh status          # Service status table
+./ailegal.sh logs backend    # Tail backend logs
+./ailegal.sh db:migrate      # Run database migrations
+./ailegal.sh db:backup       # Backup database
+./ailegal.sh test            # Run test suite
+./ailegal.sh nuke            # Full reset and rebuild
+```
+
+See `./ailegal.sh help` for all commands.
+
 ## Useful Checks
 
 ```bash
 npm run build --prefix backend
 npm run build --prefix frontend
 npm run lint --prefix frontend
+npm test --prefix backend
 ```
