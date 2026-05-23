@@ -37,6 +37,7 @@ Website: [mikeoss.com](https://mikeoss.com) | [Changelog](CHANGELOG.md) | [Roadm
 
 ## Table of Contents
 
+- [From Prototype to Platform](#from-prototype-to-platform)
 - [Key Features](#key-features)
 - [Quick Start](#quick-start)
 - [Architecture](#architecture)
@@ -50,6 +51,31 @@ Website: [mikeoss.com](https://mikeoss.com) | [Changelog](CHANGELOG.md) | [Roadm
 - [Troubleshooting](#troubleshooting)
 - [Star History](#-star-history)
 - [Contributing](#contributing)
+
+---
+
+## From Prototype to Platform
+
+What started as a cloud-dependent Supabase prototype is now an enterprise-grade, self-hosted platform.
+
+| Capability          | Before (Prototype)            | After (Self-Hosted Platform)                                                                            |
+| ------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------- |
+| **Infrastructure**  | Manual setup, cloud-dependent | 11 Docker containers, single `./ailegal.sh up`                                                          |
+| **Database**        | Supabase SDK (cloud-locked)   | Self-hosted PostgreSQL 16 + Prisma ORM (17 models, 7 enums)                                             |
+| **Auth**            | Supabase Auth (cloud)         | Self-hosted GoTrue (Supabase-compatible JWT)                                                            |
+| **Storage**         | Supabase Storage (cloud)      | Self-hosted MinIO (S3-compatible)                                                                       |
+| **Validation**      | None — raw request bodies     | Zod 4 on every endpoint, RFC 7807 error responses                                                       |
+| **Logging**         | `console.log`                 | Pino structured JSON with sensitive field redaction                                                     |
+| **Error Tracking**  | None — silent failures        | GlitchTip (Sentry-compatible), backend + frontend                                                       |
+| **Security**        | Plain text API keys           | AES-256-GCM encryption with key rotation, Helmet CSP, HMAC-signed downloads, magic-byte MIME validation |
+| **Data Integrity**  | Hard deletes, no history      | Soft-delete on 6 models, full audit trail on every mutation                                             |
+| **Testing**         | No tests                      | Vitest suite, GitHub Actions CI (Node 20/22 matrix)                                                     |
+| **Code Quality**    | No linting                    | Husky pre-commit hooks, lint-staged, Prettier                                                           |
+| **Observability**   | None                          | Three-layer health checks, smoke tests, structured logging, error tracking                              |
+| **Orchestration**   | Start each service manually   | `ailegal.sh` — 23 subcommands, dynamic port allocation, conflict detection                              |
+| **Deployment Path** | None                          | Docker Compose → k3s → Helm → KEDA autoscaling                                                          |
+| **Extensibility**   | Monolithic                    | Plugin & MCP architecture, 6 proposed plugins                                                           |
+| **LLM Compute**     | Cloud APIs only               | Cloud APIs + Local LLM (Ollama/vLLM) + AWS GPU (Bedrock/SageMaker) planned                              |
 
 ---
 
