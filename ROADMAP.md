@@ -58,6 +58,26 @@
 | Low      | Container image size optimization (distroless base images)                     | Planned |
 | Low      | Docker secrets for sensitive environment variables                             | Planned |
 
+### Deployment Progression
+
+Mike's deployment path from single-server to production cluster:
+
+```
+Docker Compose (current)
+    ↓  single host, 11 services, ./ailegal.sh orchestration
+k3s (bridge)
+    ↓  single-node K8s, same hardware, K8s API, KEDA-ready
+Helm Charts (production)
+    ↓  multi-node clusters, managed K8s (EKS/GKE/AKS)
+```
+
+| Priority | Item                                                                                                                                                                                                       | Depends On                               | Status  |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- | ------- |
+| Medium   | **k3s deployment manifests** — Translate Docker Compose into k3s-compatible manifests. Single binary install, runs on a $20 VPS, same K8s API as full clusters. Bridge between Compose and production K8s. | Distributed Workers Phase 2              | Planned |
+| Medium   | **Helm chart** (`helm/`) — Parameterized chart with `values.yaml` for all 11+ services. Supports `helm install mike ./helm` on any K8s cluster. Configurable replicas, resource limits, ingress, TLS.      | k3s manifests validated                  | Planned |
+| Low      | **KEDA ScaledObjects** — Autoscale worker pods based on Redis queue depth. Workers scale to zero when idle, spin up on demand.                                                                             | Helm chart + Distributed Workers Phase 3 | Planned |
+| Low      | **Terraform modules** — Infrastructure-as-code for cloud provisioning (VPC, RDS, ElastiCache, S3, EKS). One `terraform apply` for a production-ready cloud stack.                                          | Helm chart                               | Planned |
+
 ### API & Backend
 
 | Priority | Item                                                        | Status  |
