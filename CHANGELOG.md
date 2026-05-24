@@ -1,6 +1,27 @@
 # Changelog
 
-## [Unreleased] — 2026-05-23
+## [Unreleased] — 2026-05-24
+
+### Security Hardening (Upstream PR Integration)
+
+- Added LLM prompt injection defense — `sanitizeLlmInput()` strips control characters, collapses newlines, and truncates untrusted filenames before system prompt interpolation (PR #158)
+- Fixed timing oracle in HMAC download token verification — buffers now padded to equal length before `timingSafeEqual` (PR #81)
+- Added HKDF per-row salt for user API key encryption — new keys use `crypto.hkdfSync` with random 16-byte salt; existing rows decrypt via legacy SHA-256 path (PR #76)
+- Fixed case-insensitive email comparison in `GET /projects/:projectId` shared-with check (PR #79)
+- Added Row-Level Security deny-all policy on all public tables with auto-enable event trigger for future tables — blocks direct PostgREST data access (PR #145)
+- Added 180-second SSE stream timeout via `Promise.race` — stalled LLM calls no longer hold connections open indefinitely (PR #112)
+- Capped `POST /download-zip` at 50 documents to prevent memory exhaustion (PR #111)
+
+### Features
+
+- Added `GET /chat` cursor pagination with `?before=` (ISO timestamp) keyset pagination, default limit 50 (PR #110)
+- Added Zod validation middleware on `POST /projects/:projectId/chat` request body (PR #155)
+- Wired up monthly message credit enforcement — `checkCredits()` before LLM call (429 if exceeded), `incrementCredits()` after success, auto-reset on expiry (PR #157)
+- Added `GET /workflows/:id/export` and `POST /workflows/import` for portable `.mikeworkflow.json` transfer (PR #59)
+
+---
+
+## [0.1.0] — 2026-05-23
 
 ### Phase 1: Docker & Orchestration
 

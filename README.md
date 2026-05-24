@@ -58,24 +58,24 @@ Website: [mikeoss.com](https://mikeoss.com) | [Changelog](CHANGELOG.md) | [Roadm
 
 What started as a cloud-dependent Supabase prototype is now an enterprise-grade, self-hosted platform.
 
-| Capability          | Before (Prototype)            | After (Self-Hosted Platform)                                                                            |
-| ------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------- |
-| **Infrastructure**  | Manual setup, cloud-dependent | 11 Docker containers, single `./ailegal.sh up`                                                          |
-| **Database**        | Supabase SDK (cloud-locked)   | Self-hosted PostgreSQL 16 + Prisma ORM (17 models, 7 enums)                                             |
-| **Auth**            | Supabase Auth (cloud)         | Self-hosted GoTrue (Supabase-compatible JWT)                                                            |
-| **Storage**         | Supabase Storage (cloud)      | Self-hosted MinIO (S3-compatible)                                                                       |
-| **Validation**      | None — raw request bodies     | Zod 4 on every endpoint, RFC 7807 error responses                                                       |
-| **Logging**         | `console.log`                 | Pino structured JSON with sensitive field redaction                                                     |
-| **Error Tracking**  | None — silent failures        | GlitchTip (Sentry-compatible), backend + frontend                                                       |
-| **Security**        | Plain text API keys           | AES-256-GCM encryption with key rotation, Helmet CSP, HMAC-signed downloads, magic-byte MIME validation |
-| **Data Integrity**  | Hard deletes, no history      | Soft-delete on 6 models, full audit trail on every mutation                                             |
-| **Testing**         | No tests                      | Vitest suite, GitHub Actions CI (Node 20/22 matrix)                                                     |
-| **Code Quality**    | No linting                    | Husky pre-commit hooks, lint-staged, Prettier                                                           |
-| **Observability**   | None                          | Three-layer health checks, smoke tests, structured logging, error tracking                              |
-| **Orchestration**   | Start each service manually   | `ailegal.sh` — 23 subcommands, dynamic port allocation, conflict detection                              |
-| **Deployment Path** | None                          | Docker Compose → k3s → Helm → KEDA autoscaling                                                          |
-| **Extensibility**   | Monolithic                    | Plugin & MCP architecture, 6 proposed plugins                                                           |
-| **LLM Compute**     | Cloud APIs only               | Cloud APIs + Local LLM (Ollama/vLLM) + AWS GPU (Bedrock/SageMaker) planned                              |
+| Capability          | Before (Prototype)            | After (Self-Hosted Platform)                                                                                                |
+| ------------------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| **Infrastructure**  | Manual setup, cloud-dependent | 11 Docker containers, single `./ailegal.sh up`                                                                              |
+| **Database**        | Supabase SDK (cloud-locked)   | Self-hosted PostgreSQL 16 + Prisma ORM (17 models, 7 enums)                                                                 |
+| **Auth**            | Supabase Auth (cloud)         | Self-hosted GoTrue (Supabase-compatible JWT)                                                                                |
+| **Storage**         | Supabase Storage (cloud)      | Self-hosted MinIO (S3-compatible)                                                                                           |
+| **Validation**      | None — raw request bodies     | Zod 4 on every endpoint, RFC 7807 error responses                                                                           |
+| **Logging**         | `console.log`                 | Pino structured JSON with sensitive field redaction                                                                         |
+| **Error Tracking**  | None — silent failures        | GlitchTip (Sentry-compatible), backend + frontend                                                                           |
+| **Security**        | Plain text API keys           | AES-256-GCM + HKDF per-row salt, Helmet CSP, HMAC-signed downloads, magic-byte MIME, RLS deny-all, prompt injection defense |
+| **Data Integrity**  | Hard deletes, no history      | Soft-delete on 6 models, full audit trail on every mutation                                                                 |
+| **Testing**         | No tests                      | Vitest suite, GitHub Actions CI (Node 20/22 matrix)                                                                         |
+| **Code Quality**    | No linting                    | Husky pre-commit hooks, lint-staged, Prettier                                                                               |
+| **Observability**   | None                          | Three-layer health checks, smoke tests, structured logging, error tracking                                                  |
+| **Orchestration**   | Start each service manually   | `ailegal.sh` — 23 subcommands, dynamic port allocation, conflict detection                                                  |
+| **Deployment Path** | None                          | Docker Compose → k3s → Helm → KEDA autoscaling                                                                              |
+| **Extensibility**   | Monolithic                    | Plugin & MCP architecture, 6 proposed plugins                                                                               |
+| **LLM Compute**     | Cloud APIs only               | Cloud APIs + Local LLM (Ollama/vLLM) + AWS GPU (Bedrock/SageMaker) planned                                                  |
 
 ---
 
@@ -183,7 +183,7 @@ Express REST API with TypeScript (CommonJS). Entry point: `backend/src/index.ts`
 | Validation     | Zod 4                                                   | Request validation middleware with RFC 7807 error responses |
 | Logging        | Pino                                                    | Structured JSON logging with sensitive field redaction      |
 | Security       | Helmet (CSP), express-rate-limit, HMAC-signed downloads | Request hardening                                           |
-| Encryption     | AES-256-GCM                                             | User API keys encrypted at rest with key rotation (V1/V2)   |
+| Encryption     | AES-256-GCM + HKDF                                      | User API keys with per-row salt, key rotation (V1/V2)       |
 | Upload         | Multer + file-type                                      | Magic-byte MIME validation (not just extension checking)    |
 | Conversion     | LibreOffice                                             | DOC/DOCX to PDF server-side conversion                      |
 | Error tracking | GlitchTip/Sentry                                        | Self-hosted, Sentry-compatible error capture                |
@@ -360,18 +360,18 @@ For testing with synthetic data and disposable infrastructure, see [`docs/safe-l
 
 All endpoints are served via Nginx at `/api/` and require GoTrue JWT authentication (except health check).
 
-| Route                            | Methods                | Purpose                                                     |
-| -------------------------------- | ---------------------- | ----------------------------------------------------------- |
-| `/health`                        | GET                    | Health check (unauthenticated)                              |
-| `/chat`                          | POST                   | AI chat with streaming (SSE), create chats, generate titles |
-| `/projects`                      | GET, POST, PUT, DELETE | Project CRUD, sharing, subfolder management                 |
-| `/projects/:projectId/chat`      | POST                   | Project-scoped AI chat with streaming                       |
-| `/projects/:projectId/documents` | GET, POST              | Document upload and listing within projects                 |
-| `/single-documents`              | GET, POST, PUT, DELETE | Standalone document CRUD, version management                |
-| `/tabular-review`                | GET, POST, PUT, DELETE | Tabular reviews, cell updates, review chat                  |
-| `/workflows`                     | GET, POST, PUT, DELETE | Workflow templates, sharing, hide/unhide                    |
-| `/user`                          | GET, PUT               | Profile, API key management (encrypted)                     |
-| `/downloads`                     | GET                    | Secure file downloads with HMAC-signed tokens               |
+| Route                            | Methods                | Purpose                                                           |
+| -------------------------------- | ---------------------- | ----------------------------------------------------------------- |
+| `/health`                        | GET                    | Health check (unauthenticated)                                    |
+| `/chat`                          | GET, POST              | Chat list (paginated `?before=`), streaming (SSE), create, titles |
+| `/projects`                      | GET, POST, PUT, DELETE | Project CRUD, sharing, subfolder management                       |
+| `/projects/:projectId/chat`      | POST                   | Project-scoped AI chat with streaming                             |
+| `/projects/:projectId/documents` | GET, POST              | Document upload and listing within projects                       |
+| `/single-documents`              | GET, POST, PUT, DELETE | Standalone document CRUD, version management                      |
+| `/tabular-review`                | GET, POST, PUT, DELETE | Tabular reviews, cell updates, review chat                        |
+| `/workflows`                     | GET, POST, PUT, DELETE | Workflow templates, sharing, hide/unhide, export/import           |
+| `/user`                          | GET, PUT               | Profile, API key management (encrypted)                           |
+| `/downloads`                     | GET                    | Secure file downloads with HMAC-signed tokens                     |
 
 Rate limiting is applied per-IP: chat endpoints (stricter), upload endpoints (stricter), general endpoints (standard).
 

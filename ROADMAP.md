@@ -14,6 +14,16 @@
 - [x] GlitchTip error tracking (backend + frontend)
 - [x] Magic-byte MIME file validation for uploads
 - [x] Pre-commit hooks (Husky + lint-staged + Prettier)
+- [x] LLM prompt injection defense (filename sanitization before system prompt interpolation)
+- [x] HKDF per-row salt for user API key encryption (backward-compatible with legacy keys)
+- [x] Timing-safe HMAC download token verification
+- [x] Row-Level Security deny-all on all PostgREST-exposed tables
+- [x] SSE stream timeout (180s) to prevent stalled LLM connections
+- [x] Download-zip document cap (50 max)
+- [x] Chat cursor pagination (`?before=` keyset)
+- [x] ProjectChat Zod request body validation
+- [x] Monthly message credit enforcement
+- [x] Workflow export/import (`.mikeworkflow.json`)
 
 ---
 

@@ -65,7 +65,10 @@ Entry point: `backend/src/index.ts` — Express server with Helmet (CSP enabled)
 - `redis.ts` — Redis cache-aside helpers (get, set, delete)
 - `validation.ts` + `validation/` — Zod schema validation middleware
 - `errorTracking.ts` — GlitchTip/Sentry integration
-- `keyRotation.ts` — AES-256 encryption key rotation (V1→V2)
+- `keyRotation.ts` — AES-256 encryption key rotation (V1→V2), HKDF per-row salt derivation
+- `sanitize.ts` — `sanitizeLlmInput()` for prompt injection defense (NFC normalize, strip control chars, collapse newlines)
+- `streamTimeout.ts` — `withStreamTimeout()` wrapper for SSE stream timeout (180s default)
+- `credits.ts` — `checkCredits()` / `incrementCredits()` for monthly message credit enforcement
 - `llm/` — Provider abstraction (Claude, Gemini, OpenAI)
 - `chatTools.ts` — Chat logic, document context, tool definitions
 - `storage.ts` — S3/MinIO file operations
@@ -132,7 +135,7 @@ Copy `.env.example` to `.env` at the repo root. Key groups:
 
 - Framework: Vitest
 - Run: `npm test --prefix backend` or `./ailegal.sh test`
-- Test files: `backend/tests/`
+- Test files: `backend/tests/` (40 tests across validation, middleware, and lib)
 - CI: GitHub Actions (`.github/workflows/ci.yml`) — lint, build (Node 20/22), test
 
 ## Contribution Guidelines
