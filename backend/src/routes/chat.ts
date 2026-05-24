@@ -16,6 +16,7 @@ import { checkProjectAccess } from "../lib/access";
 import { logger } from "../lib/logger";
 import { auditLog } from "../lib/audit";
 import { withStreamTimeout, StreamTimeoutError } from "../lib/streamTimeout";
+import { checkCredits, incrementCredits } from "../lib/credits";
 
 export const chatRouter = Router();
 
@@ -473,6 +474,11 @@ chatRouter.post("/", requireAuth, async (req, res) => {
 
   const workflowStore = await buildWorkflowStore(userId, userEmail);
 
+  const creditCheck = await checkCredits(userId);
+  if (!creditCheck.ok) {
+    return void res.status(429).json({ detail: creditCheck.detail });
+  }
+
   devLog("[chat/stream] starting LLM stream", {
     apiMessageCount: apiMessages.length,
     docCount: Object.keys(docIndex).length,
@@ -527,6 +533,8 @@ chatRouter.post("/", requireAuth, async (req, res) => {
         data: { title: lastUser.content.slice(0, 120) },
       });
     }
+
+    await incrementCredits(userId);
   } catch (err) {
     if (err instanceof StreamTimeoutError) {
       logger.warn({ chatId }, "[chat/stream] LLM stream timed out");

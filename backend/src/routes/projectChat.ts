@@ -18,6 +18,7 @@ import { logger } from "../lib/logger";
 import { withStreamTimeout, StreamTimeoutError } from "../lib/streamTimeout";
 import { validate } from "../lib/validation";
 import { zodProjectChatBody } from "../lib/validation/common";
+import { checkCredits, incrementCredits } from "../lib/credits";
 
 const PROJECT_SYSTEM_PROMPT_EXTRA = `PROJECT CONTEXT:
 You are operating within a project folder that contains a collection of legal documents the user has organised for a single matter. The user's questions will usually refer to one or more documents in this project — your job is to find the relevant files to work on. Use list_documents to see what is available and fetch_documents / read_document to pull in any documents you need before answering.
@@ -122,6 +123,11 @@ projectChatRouter.post("/", validate(zodProjectChatBody), requireAuth, async (re
 
   const workflowStore = await buildWorkflowStore(userId, userEmail);
 
+  const creditCheck = await checkCredits(userId);
+  if (!creditCheck.ok) {
+    return void res.status(429).json({ detail: creditCheck.detail });
+  }
+
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
@@ -166,6 +172,8 @@ projectChatRouter.post("/", validate(zodProjectChatBody), requireAuth, async (re
         data: { title: lastUser.content.slice(0, 120) },
       });
     }
+
+    await incrementCredits(userId);
   } catch (err) {
     if (err instanceof StreamTimeoutError) {
       logger.warn({ chatId }, "[project-chat/stream] LLM stream timed out");
