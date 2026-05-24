@@ -262,7 +262,7 @@ workflowsRouter.post(
       },
     });
 
-    await auditLog({ userId, action: "import", entity: "workflow", entityId: workflow.id });
+    await auditLog({ userId, action: "create", entity: "workflow", entityId: workflow.id });
     res.status(201).json(workflow);
   }),
 );
