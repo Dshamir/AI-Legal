@@ -2,6 +2,31 @@
 
 ## [Unreleased] — 2026-05-24
 
+### Docker & Deployment Fixes
+
+- Fixed GoTrue `auth` schema creation — added `docker/postgres/00-init-auth-schema.sql` init script that creates the `auth` schema and `postgres` role on first boot
+- Fixed GoTrue migration failure — added `search_path=auth` to GoTrue DB connection string so unqualified type creates land in the correct schema
+- Fixed GlitchTip database — added `docker/postgres/01-create-glitchtip-db.sh` to auto-create the `glitchtip` database
+- Fixed backend crash in Docker — `NODE_ENV` defaulted to `development` in docker-compose, causing `pino-pretty` import failure in production image; changed default to `production`
+- Fixed Prisma 7.x client engine — installed `@prisma/adapter-pg` and `pg` driver, wired `PrismaPg` adapter into `prisma.ts`
+- Fixed frontend Docker binding — added `HOSTNAME: "0.0.0.0"` env var so Next.js standalone binds to all interfaces, not just container IP
+- Fixed all Docker healthchecks — switched from `localhost` to `127.0.0.1` (IPv6 resolution failure), switched GlitchTip from `wget` to Python `urllib`, disabled PostgREST healthcheck (distroless image has no shell)
+- Fixed nginx healthcheck port — corrected from port 3000 to port 80
+- Added `.dockerignore` for frontend (7.2 GB `node_modules` was being sent as Docker context) and backend (2.5 GB)
+- Removed stale `backend/.env` with Prisma placeholder `DATABASE_URL` that overrode the root `.env` in Docker Compose
+
+### Auth & Networking
+
+- Fixed CORS on GoTrue auth — proxied GoTrue through nginx at `/auth/v1/` (rewrite to `/`) so browser auth requests are same-origin; changed `NEXT_PUBLIC_SUPABASE_URL` from `http://localhost:9999` to `http://localhost`
+- Rewrote `auth.ts` middleware — replaced Supabase JS client (which prepends `/auth/v1/` path not supported by self-hosted GoTrue) with direct `fetch` to GoTrue's `/user` endpoint
+- Added ngrok tunnel support — `mike-ngrok` container with `--add-host=host.docker.internal:host-gateway` for WSL2 compatibility; added `https://ailegal.ngrok.dev` to `GOTRUE_URI_ALLOW_LIST`
+
+### Bug Fixes
+
+- Fixed document context loading in chat — `buildDocContext()` had camelCase/snake_case mismatch: Prisma returns `currentVersionId`/`fileType` but code cast to `current_version_id`/`file_type` via `as unknown as`, causing all documents to be skipped with `storage_path = undefined`
+- Fixed MinIO bucket creation — added `mc mb local/mike` on first boot (bucket did not exist)
+- Fixed PgAdmin startup — changed `PGADMIN_DEFAULT_EMAIL` from `admin@mike.local` (rejected by newer pgAdmin email validation) to `admin@localhost.dev`
+
 ### Security Hardening (Upstream PR Integration)
 
 - Added LLM prompt injection defense — `sanitizeLlmInput()` strips control characters, collapses newlines, and truncates untrusted filenames before system prompt interpolation (PR #158)

@@ -24,6 +24,14 @@
 - [x] ProjectChat Zod request body validation
 - [x] Monthly message credit enforcement
 - [x] Workflow export/import (`.mikeworkflow.json`)
+- [x] Docker first-boot initialization (GoTrue auth schema, postgres role, GlitchTip DB, MinIO bucket)
+- [x] Prisma 7.x client engine migration (`@prisma/adapter-pg` + `PrismaPg` adapter)
+- [x] GoTrue auth proxy through nginx (eliminates CORS, enables ngrok tunneling)
+- [x] Direct GoTrue `/user` auth middleware (replaces Supabase JS client path mismatch)
+- [x] Document context loading fix (camelCase/snake_case field mapping in `buildDocContext`)
+- [x] `.dockerignore` files for frontend (7.2 GB) and backend (2.5 GB)
+- [x] Docker healthcheck hardening (IPv6 fix, distroless compat, correct ports)
+- [x] Ngrok tunnel integration with `host.docker.internal` for WSL2
 
 ---
 
@@ -64,7 +72,7 @@
 | High     | Prometheus + Grafana monitoring stack                                          | Planned |
 | Medium   | MinIO lifecycle policies for storage cleanup (expired uploads, orphaned files) | Planned |
 | Medium   | Automated database backup schedule (cron)                                      | Planned |
-| Medium   | Ngrok integration for external access tunneling                                | Planned |
+| Medium   | ~~Ngrok integration for external access tunneling~~                            | Done    |
 | Low      | Container image size optimization (distroless base images)                     | Planned |
 | Low      | Docker secrets for sensitive environment variables                             | Planned |
 

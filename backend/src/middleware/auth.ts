@@ -1,11 +1,6 @@
 import { Request, Response, NextFunction } from "express";
-import { createClient } from "@supabase/supabase-js";
 
-export async function requireAuth(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-): Promise<void> {
+export async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   const auth = req.headers.authorization ?? "";
   if (!auth.startsWith("Bearer ")) {
     res.status(401).json({ detail: "Missing or invalid Authorization header" });
@@ -13,25 +8,31 @@ export async function requireAuth(
   }
   const token = auth.slice(7).trim();
 
-  const supabaseUrl = process.env.SUPABASE_URL ?? "";
-  const serviceKey = process.env.SUPABASE_SECRET_KEY ?? "";
-
-  if (!supabaseUrl || !serviceKey) {
+  const gotrueUrl = process.env.SUPABASE_URL ?? "";
+  if (!gotrueUrl) {
     res.status(500).json({ detail: "Server auth is not configured" });
     return;
   }
 
-  const admin = createClient(supabaseUrl, serviceKey, {
-    auth: { persistSession: false },
-  });
-  const { data } = await admin.auth.getUser(token);
-  if (!data.user) {
-    res.status(401).json({ detail: "Invalid or expired token" });
-    return;
-  }
+  try {
+    const resp = await fetch(`${gotrueUrl}/user`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!resp.ok) {
+      res.status(401).json({ detail: "Invalid or expired token" });
+      return;
+    }
+    const user = await resp.json();
+    if (!user?.id) {
+      res.status(401).json({ detail: "Invalid or expired token" });
+      return;
+    }
 
-  res.locals.userId = data.user.id;
-  res.locals.userEmail = data.user.email?.toLowerCase() ?? "";
-  res.locals.token = token;
-  next();
+    res.locals.userId = user.id;
+    res.locals.userEmail = (user.email ?? "").toLowerCase();
+    res.locals.token = token;
+    next();
+  } catch {
+    res.status(502).json({ detail: "Auth service unavailable" });
+  }
 }

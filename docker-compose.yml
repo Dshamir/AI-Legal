@@ -8,6 +8,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - pg-data:/var/lib/postgresql/data
+      - ./docker/postgres:/docker-entrypoint-initdb.d:ro
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     networks:
@@ -78,7 +79,7 @@ services:
     networks:
       - mike-internal
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9999/health"]
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9999/health"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -99,10 +100,8 @@ services:
     networks:
       - mike-internal
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test: ["NONE"]
+      interval: 30s
 
   pgadmin:
     image: dpage/pgadmin4:latest
@@ -140,10 +139,17 @@ services:
     networks:
       - mike-internal
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8000/_health/"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/_health/')",
+        ]
       interval: 15s
       timeout: 5s
       retries: 5
+      start_period: 30s
 
   glitchtip-worker:
     image: glitchtip/glitchtip:latest
@@ -191,13 +197,13 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       RESEND_API_KEY: ${RESEND_API_KEY:-}
       SENTRY_DSN: ${SENTRY_DSN:-}
-      NODE_ENV: ${NODE_ENV:-development}
+      NODE_ENV: ${NODE_ENV:-production}
     ports:
       - "${BACKEND_PORT:-3001}:3001"
     networks:
       - mike-internal
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3001/health"]
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3001/health"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -211,7 +217,8 @@ services:
       backend:
         condition: service_healthy
     environment:
-      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-http://localhost:9999}
+      HOSTNAME: "0.0.0.0"
+      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-http://localhost}
       NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY: ${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY}
       NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost/api}
     ports:
@@ -235,10 +242,11 @@ services:
       - mike-internal
       - mike-public
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost/health"]
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:80/"]
       interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
+      start_period: 15s
 
 volumes:
   pg-data:

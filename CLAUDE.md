@@ -59,7 +59,7 @@ Entry point: `backend/src/index.ts` — Express server with Helmet (CSP enabled)
 
 **Libraries** (`backend/src/lib/`):
 
-- `prisma.ts` — Prisma client with soft-delete extension
+- `prisma.ts` — Prisma client with `@prisma/adapter-pg` driver and soft-delete extension
 - `logger.ts` — Pino structured logger with sensitive field redaction
 - `audit.ts` — Audit log utility (writes to `audit_log` table)
 - `redis.ts` — Redis cache-aside helpers (get, set, delete)
@@ -77,7 +77,7 @@ Entry point: `backend/src/index.ts` — Express server with Helmet (CSP enabled)
 
 **Middleware** (`backend/src/middleware/`):
 
-- `auth.ts` — JWT validation via GoTrue `getUser()`
+- `auth.ts` — JWT validation via direct `fetch` to GoTrue `/user` endpoint
 - `errorHandler.ts` — Global error handler (RFC 7807 responses)
 - `requestId.ts` — X-Request-ID propagation
 - `cache.ts` — HTTP Cache-Control headers
@@ -125,11 +125,14 @@ PostgreSQL via **Prisma ORM**.
 Copy `.env.example` to `.env` at the repo root. Key groups:
 
 - Postgres credentials + `DATABASE_URL`
-- GoTrue auth (`GOTRUE_JWT_SECRET`, `GOTRUE_SITE_URL`)
+- GoTrue auth (`GOTRUE_JWT_SECRET`, `GOTRUE_SITE_URL`, `GOTRUE_DB_DATABASE_URL` with `&search_path=auth`)
 - MinIO/S3 storage credentials
 - Redis URL
 - LLM provider API keys (Anthropic/Gemini/OpenAI — at least one)
 - GlitchTip DSN (for error tracking)
+- `NEXT_PUBLIC_SUPABASE_URL` — set to nginx origin (`http://localhost`), NOT GoTrue port directly
+
+**Docker first-boot:** Postgres init scripts in `docker/postgres/` auto-create the `auth` schema, `postgres` role, and `glitchtip` database. MinIO bucket must be created manually: `docker exec mike-minio-1 mc alias set local http://localhost:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD && docker exec mike-minio-1 mc mb local/mike`
 
 ## Testing
 

@@ -2798,14 +2798,15 @@ export async function buildDocContext(
       },
     });
 
-    const docList = (docs ?? []) as unknown as {
-      id: string;
-      filename: string;
-      file_type: string;
-      current_version_id?: string | null;
-      active_version_number?: number | null;
-      storage_path?: string | null;
-    }[];
+    const docList = (docs ?? []).map((d) => ({
+      id: d.id,
+      filename: d.filename,
+      file_type: d.fileType,
+      current_version_id: d.currentVersionId ?? null,
+      active_version_number: null as number | null,
+      storage_path: null as string | null,
+      pdf_storage_path: null as string | null,
+    }));
     await attachActiveVersionPaths(docList);
     for (let i = 0; i < docList.length; i++) {
       const doc = docList[i];
@@ -2818,8 +2819,8 @@ export async function buildDocContext(
         version_number: doc.active_version_number ?? null,
       };
       docStore.set(docLabel, {
-        storage_path: doc.storage_path,
-        file_type: doc.file_type,
+        storage_path: doc.storage_path!,
+        file_type: doc.file_type ?? "docx",
         filename: doc.filename,
       });
     }
@@ -2867,15 +2868,16 @@ export async function buildProjectDocContext(
       select: { id: true, name: true, parentFolderId: true },
     }),
   ]);
-  const docList = (docs ?? []) as unknown as {
-    id: string;
-    filename: string;
-    file_type: string;
-    current_version_id?: string | null;
-    active_version_number?: number | null;
-    folder_id?: string | null;
-    storage_path?: string | null;
-  }[];
+  const docList = (docs ?? []).map((d) => ({
+    id: d.id,
+    filename: d.filename,
+    file_type: d.fileType,
+    current_version_id: d.currentVersionId ?? null,
+    active_version_number: null as number | null,
+    folder_id: (d as any).folderId ?? null,
+    storage_path: null as string | null,
+    pdf_storage_path: null as string | null,
+  }));
   await attachActiveVersionPaths(docList);
 
   // Build folder id → full path map
@@ -2912,8 +2914,8 @@ export async function buildProjectDocContext(
       version_number: doc.active_version_number ?? null,
     };
     docStore.set(docLabel, {
-      storage_path: doc.storage_path,
-      file_type: doc.file_type,
+      storage_path: doc.storage_path!,
+      file_type: doc.file_type ?? "docx",
       filename: doc.filename,
     });
     const path = resolvePath(doc.folder_id ?? null);
