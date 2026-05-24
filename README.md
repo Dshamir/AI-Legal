@@ -62,7 +62,7 @@ What started as a cloud-dependent Supabase prototype is now an enterprise-grade,
 | ------------------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
 | **Infrastructure**  | Manual setup, cloud-dependent | 11 Docker containers, single `./ailegal.sh up`                                                                              |
 | **Database**        | Supabase SDK (cloud-locked)   | Self-hosted PostgreSQL 16 + Prisma ORM (17 models, 7 enums)                                                                 |
-| **Auth**            | Supabase Auth (cloud)         | Self-hosted GoTrue (Supabase-compatible JWT)                                                                                |
+| **Auth**            | Supabase Auth (cloud)         | Self-hosted GoTrue (JWT authentication)                                                                                     |
 | **Storage**         | Supabase Storage (cloud)      | Self-hosted MinIO (S3-compatible)                                                                                           |
 | **Validation**      | None — raw request bodies     | Zod 4 on every endpoint, RFC 7807 error responses                                                                           |
 | **Logging**         | `console.log`                 | Pino structured JSON with sensitive field redaction                                                                         |
@@ -153,8 +153,8 @@ Sign up, add an API key in **Account > Models & API Keys** if not set in `.env`,
 │  │  │   gotrue     │                                                 │    │
 │  │  │  (:9999)     │                                                 │    │
 │  │  │ JWT Auth     │                                                 │    │
-│  │  │ Supabase-    │                                                 │    │
-│  │  │ compatible   │                                                 │    │
+│  │  │ Self-hosted  │                                                 │    │
+│  │  │              │                                                 │    │
 │  │  └─────────────┘                                                 │    │
 │  └──────────────────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────────────────────┘
@@ -216,19 +216,19 @@ Switchable per request. Streaming via SSE. Function calling / tool use for docum
 
 ## Services
 
-| Service              | Port        | Purpose                                  |
-| -------------------- | ----------- | ---------------------------------------- |
-| **nginx**            | 80          | Reverse proxy (single entry point)       |
-| **frontend**         | 3000        | Next.js web application                  |
-| **backend**          | 3001        | Express REST API                         |
-| **postgres**         | 5432        | PostgreSQL 16 database                   |
-| **gotrue**           | 9999        | Authentication (Supabase-compatible JWT) |
-| **postgrest**        | 3002        | Auto-generated REST API over Postgres    |
-| **minio**            | 9000 / 9001 | S3-compatible object storage + console   |
-| **redis**            | 6379        | Caching layer                            |
-| **pgadmin**          | 5050        | Database admin GUI                       |
-| **glitchtip**        | 8000        | Error tracking (Sentry-compatible)       |
-| **glitchtip-worker** | —           | Background job processor                 |
+| Service              | Port        | Purpose                                |
+| -------------------- | ----------- | -------------------------------------- |
+| **nginx**            | 80          | Reverse proxy (single entry point)     |
+| **frontend**         | 3000        | Next.js web application                |
+| **backend**          | 3001        | Express REST API                       |
+| **postgres**         | 5432        | PostgreSQL 16 database                 |
+| **gotrue**           | 9999        | Authentication (self-hosted JWT)       |
+| **postgrest**        | 3002        | Auto-generated REST API over Postgres  |
+| **minio**            | 9000 / 9001 | S3-compatible object storage + console |
+| **redis**            | 6379        | Caching layer                          |
+| **pgadmin**          | 5050        | Database admin GUI                     |
+| **glitchtip**        | 8000        | Error tracking (Sentry-compatible)     |
+| **glitchtip-worker** | —           | Background job processor               |
 
 ---
 
@@ -304,7 +304,7 @@ Copy `.env.example` to `.env` at the repo root. Organized by service:
 | MinIO     | `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`, `R2_BUCKET_NAME`                         |
 | Redis     | `REDIS_URL`                                                                        |
 | Backend   | `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, `DOWNLOAD_SIGNING_SECRET` |
-| Frontend  | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_API_BASE_URL`                             |
+| Frontend  | `NEXT_PUBLIC_SUPABASE_URL` (GoTrue endpoint), `NEXT_PUBLIC_API_BASE_URL`           |
 | GlitchTip | `GLITCHTIP_SECRET_KEY`, `SENTRY_DSN`                                               |
 | pgAdmin   | `PGADMIN_DEFAULT_EMAIL`, `PGADMIN_DEFAULT_PASSWORD`                                |
 

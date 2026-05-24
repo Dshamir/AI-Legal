@@ -77,7 +77,7 @@ Entry point: `backend/src/index.ts` — Express server with Helmet (CSP enabled)
 
 **Middleware** (`backend/src/middleware/`):
 
-- `auth.ts` — JWT validation via GoTrue/Supabase `getUser()`
+- `auth.ts` — JWT validation via GoTrue `getUser()`
 - `errorHandler.ts` — Global error handler (RFC 7807 responses)
 - `requestId.ts` — X-Request-ID propagation
 - `cache.ts` — HTTP Cache-Control headers
@@ -107,18 +107,18 @@ PostgreSQL via **Prisma ORM**.
 
 ### Docker Services
 
-| Service   | Port      | Purpose                    |
-| --------- | --------- | -------------------------- |
-| postgres  | 5432      | PostgreSQL 16              |
-| redis     | 6379      | Cache                      |
-| minio     | 9000/9001 | S3-compatible storage      |
-| gotrue    | 9999      | Auth (Supabase-compatible) |
-| postgrest | 3002      | REST API over Postgres     |
-| pgadmin   | 5050      | Database admin GUI         |
-| glitchtip | 8000      | Error tracking             |
-| backend   | 3001      | Express API                |
-| frontend  | 3000      | Next.js app                |
-| nginx     | 80        | Reverse proxy              |
+| Service   | Port      | Purpose                |
+| --------- | --------- | ---------------------- |
+| postgres  | 5432      | PostgreSQL 16          |
+| redis     | 6379      | Cache                  |
+| minio     | 9000/9001 | S3-compatible storage  |
+| gotrue    | 9999      | Auth (self-hosted JWT) |
+| postgrest | 3002      | REST API over Postgres |
+| pgadmin   | 5050      | Database admin GUI     |
+| glitchtip | 8000      | Error tracking         |
+| backend   | 3001      | Express API            |
+| frontend  | 3000      | Next.js app            |
+| nginx     | 80        | Reverse proxy          |
 
 ## Environment Setup
 
