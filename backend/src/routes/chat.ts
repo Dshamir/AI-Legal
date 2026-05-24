@@ -132,9 +132,10 @@ async function getAccessibleChat(
 chatRouter.get("/", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
   const requestedLimit = Number.parseInt(String(req.query.limit ?? ""), 10);
-  const limit = Number.isFinite(requestedLimit)
-    ? Math.min(Math.max(requestedLimit, 1), 100)
-    : undefined;
+  const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 50;
+
+  const before = typeof req.query.before === "string" ? new Date(req.query.before) : null;
+  const isValidBefore = before && !isNaN(before.getTime());
 
   const ownProjects = await prisma.project.findMany({
     where: { userId },
@@ -142,12 +143,17 @@ chatRouter.get("/", requireAuth, async (req, res) => {
   });
   const ownProjectIds = ownProjects.map((p) => p.id);
 
+  const whereClause: any = {
+    OR: [{ userId }, ...(ownProjectIds.length > 0 ? [{ projectId: { in: ownProjectIds } }] : [])],
+  };
+  if (isValidBefore) {
+    whereClause.createdAt = { lt: before };
+  }
+
   const chats = await prisma.chat.findMany({
-    where: {
-      OR: [{ userId }, ...(ownProjectIds.length > 0 ? [{ projectId: { in: ownProjectIds } }] : [])],
-    },
+    where: whereClause,
     orderBy: { createdAt: "desc" },
-    ...(limit ? { take: limit } : {}),
+    take: limit,
   });
 
   res.json(chats);

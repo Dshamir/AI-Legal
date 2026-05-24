@@ -16,6 +16,8 @@ import { getUserApiKeys } from "../lib/userSettings";
 import { checkProjectAccess } from "../lib/access";
 import { logger } from "../lib/logger";
 import { withStreamTimeout, StreamTimeoutError } from "../lib/streamTimeout";
+import { validate } from "../lib/validation";
+import { zodProjectChatBody } from "../lib/validation/common";
 
 const PROJECT_SYSTEM_PROMPT_EXTRA = `PROJECT CONTEXT:
 You are operating within a project folder that contains a collection of legal documents the user has organised for a single matter. The user's questions will usually refer to one or more documents in this project — your job is to find the relevant files to work on. Use list_documents to see what is available and fetch_documents / read_document to pull in any documents you need before answering.
@@ -28,7 +30,7 @@ When the user wants to use an existing project document as a starting point for 
 export const projectChatRouter = Router({ mergeParams: true });
 
 // POST /projects/:projectId/chat — streaming
-projectChatRouter.post("/", requireAuth, async (req, res) => {
+projectChatRouter.post("/", validate(zodProjectChatBody), requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
   const userEmail = res.locals.userEmail as string | undefined;
   const { projectId } = req.params;
