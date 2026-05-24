@@ -12,10 +12,7 @@ import {
   versionStorageKey,
 } from "../lib/storage";
 import { docxToPdf, convertedPdfKey } from "../lib/convert";
-import {
-  extractTrackedChangeIds,
-  resolveTrackedChange,
-} from "../lib/docxTrackedChanges";
+import { extractTrackedChangeIds, resolveTrackedChange } from "../lib/docxTrackedChanges";
 import { buildDownloadUrl } from "../lib/downloadTokens";
 import {
   attachActiveVersionPaths,
@@ -46,15 +43,10 @@ documentsRouter.get("/", requireAuth, async (req, res) => {
 });
 
 // POST /single-documents
-documentsRouter.post(
-  "/",
-  requireAuth,
-  singleFileUpload("file"),
-  async (req, res) => {
-    const userId = res.locals.userId as string;
-    await handleDocumentUpload(req, res, userId, null);
-  },
-);
+documentsRouter.post("/", requireAuth, singleFileUpload("file"), async (req, res) => {
+  const userId = res.locals.userId as string;
+  await handleDocumentUpload(req, res, userId, null);
+});
 
 // DELETE /single-documents/:documentId
 documentsRouter.delete("/:documentId", requireAuth, async (req, res) => {
@@ -65,8 +57,7 @@ documentsRouter.delete("/:documentId", requireAuth, async (req, res) => {
     where: { id: documentId, userId },
     select: { id: true },
   });
-  if (!doc)
-    return void res.status(404).json({ detail: "Document not found" });
+  if (!doc) return void res.status(404).json({ detail: "Document not found" });
 
   // Storage now lives on document_versions — fan out and delete each
   // version's bytes (DOCX + PDF rendition) before dropping rows.
@@ -98,53 +89,38 @@ documentsRouter.get("/:documentId/display", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
   const userEmail = res.locals.userEmail as string;
   const { documentId } = req.params;
-  const versionIdParam =
-    typeof req.query.version_id === "string" ? req.query.version_id : null;
+  const versionIdParam = typeof req.query.version_id === "string" ? req.query.version_id : null;
 
   const doc = await prisma.document.findUnique({
     where: { id: documentId },
     select: { id: true, filename: true, fileType: true, userId: true, projectId: true },
   });
-  if (!doc)
-    return void res.status(404).json({ detail: "Document not found" });
+  if (!doc) return void res.status(404).json({ detail: "Document not found" });
   const access = await ensureDocAccess(doc, userId, userEmail);
-  if (!access.ok)
-    return void res.status(404).json({ detail: "Document not found" });
+  if (!access.ok) return void res.status(404).json({ detail: "Document not found" });
 
   const active = await loadActiveVersion(documentId, versionIdParam);
-  if (!active)
-    return void res.status(404).json({ detail: "No file available" });
+  if (!active) return void res.status(404).json({ detail: "No file available" });
 
   const fileType = doc.fileType ?? "";
   const isDocx = fileType === "docx" || fileType === "doc";
 
   // For DOCX, prefer the per-version PDF rendition if one exists.
   const servePath =
-    isDocx && active.pdf_storage_path
-      ? active.pdf_storage_path
-      : active.storage_path;
+    isDocx && active.pdf_storage_path ? active.pdf_storage_path : active.storage_path;
   const raw = await downloadFile(servePath);
-  if (!raw)
-    return void res
-      .status(404)
-      .json({ detail: "Document not found in storage" });
+  if (!raw) return void res.status(404).json({ detail: "Document not found in storage" });
 
   if (fileType === "pdf" || (isDocx && active.pdf_storage_path)) {
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader(
-      "Content-Disposition",
-      buildContentDisposition("inline", doc.filename),
-    );
+    res.setHeader("Content-Disposition", buildContentDisposition("inline", doc.filename));
     res.send(Buffer.from(raw));
   } else {
     res.setHeader(
       "Content-Type",
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     );
-    res.setHeader(
-      "Content-Disposition",
-      buildContentDisposition("inline", doc.filename),
-    );
+    res.setHeader("Content-Disposition", buildContentDisposition("inline", doc.filename));
     res.send(Buffer.from(raw));
   }
 });
@@ -158,9 +134,22 @@ documentsRouter.post("/download-zip", requireAuth, async (req, res) => {
   if (!Array.isArray(document_ids) || document_ids.length === 0)
     return void res.status(400).json({ detail: "document_ids is required" });
 
+  const MAX_ZIP_DOCUMENTS = 50;
+  if (document_ids.length > MAX_ZIP_DOCUMENTS)
+    return void res
+      .status(400)
+      .json({ detail: `Too many documents. Maximum is ${MAX_ZIP_DOCUMENTS}.` });
+
   const rawDocs = await prisma.document.findMany({
     where: { id: { in: document_ids } },
-    select: { id: true, filename: true, fileType: true, currentVersionId: true, userId: true, projectId: true },
+    select: {
+      id: true,
+      filename: true,
+      fileType: true,
+      currentVersionId: true,
+      userId: true,
+      projectId: true,
+    },
   });
 
   // Filter to docs the user actually has access to (own + shared-project).
@@ -170,11 +159,8 @@ documentsRouter.post("/download-zip", requireAuth, async (req, res) => {
       access: await ensureDocAccess(d, userId, userEmail),
     })),
   );
-  const docs = accessChecks
-    .filter((x) => x.access.ok)
-    .map((x) => x.doc);
-  if (docs.length === 0)
-    return void res.status(404).json({ detail: "No documents found" });
+  const docs = accessChecks.filter((x) => x.access.ok).map((x) => x.doc);
+  if (docs.length === 0) return void res.status(404).json({ detail: "No documents found" });
 
   const JSZip = (await import("jszip")).default;
   const zip = new JSZip();
@@ -206,28 +192,20 @@ documentsRouter.get("/:documentId/url", requireAuth, async (req, res) => {
     where: { id: documentId },
     select: { id: true, filename: true, userId: true, projectId: true },
   });
-  if (!doc)
-    return void res.status(404).json({ detail: "Document not found" });
+  if (!doc) return void res.status(404).json({ detail: "Document not found" });
   const access = await ensureDocAccess(doc, userId, userEmail);
-  if (!access.ok)
-    return void res.status(404).json({ detail: "Document not found" });
+  if (!access.ok) return void res.status(404).json({ detail: "Document not found" });
 
   const active = await loadActiveVersion(documentId, versionIdParam);
-  if (!active)
-    return void res.status(404).json({ detail: "No file available" });
+  if (!active) return void res.status(404).json({ detail: "No file available" });
 
   const downloadFilename = resolveDownloadFilename(
     doc.filename,
     active.display_name,
     active.version_number,
   );
-  const url = await getSignedUrl(
-    active.storage_path,
-    3600,
-    downloadFilename,
-  );
-  if (!url)
-    return void res.status(503).json({ detail: "Storage not configured" });
+  const url = await getSignedUrl(active.storage_path, 3600, downloadFilename);
+  if (!url) return void res.status(503).json({ detail: "Storage not configured" });
 
   res.json({
     url,
@@ -249,19 +227,15 @@ documentsRouter.get("/:documentId/docx", requireAuth, async (req, res) => {
     where: { id: documentId },
     select: { id: true, filename: true, userId: true, projectId: true },
   });
-  if (!doc)
-    return void res.status(404).json({ detail: "Document not found" });
+  if (!doc) return void res.status(404).json({ detail: "Document not found" });
   const access = await ensureDocAccess(doc, userId, userEmail);
-  if (!access.ok)
-    return void res.status(404).json({ detail: "Document not found" });
+  if (!access.ok) return void res.status(404).json({ detail: "Document not found" });
 
   const active = await loadActiveVersion(documentId, versionIdParam);
-  if (!active)
-    return void res.status(404).json({ detail: "No file available" });
+  if (!active) return void res.status(404).json({ detail: "No file available" });
 
   const raw = await downloadFile(active.storage_path);
-  if (!raw)
-    return void res.status(404).json({ detail: "Document bytes not available" });
+  if (!raw) return void res.status(404).json({ detail: "Document bytes not available" });
 
   res.setHeader(
     "Content-Type",
@@ -271,11 +245,7 @@ documentsRouter.get("/:documentId/docx", requireAuth, async (req, res) => {
     "Content-Disposition",
     buildContentDisposition(
       "inline",
-      resolveDownloadFilename(
-        doc.filename,
-        active.display_name,
-        active.version_number,
-      ),
+      resolveDownloadFilename(doc.filename, active.display_name, active.version_number),
     ),
   );
   res.send(Buffer.from(raw));
@@ -321,11 +291,9 @@ documentsRouter.get("/:documentId/versions", requireAuth, async (req, res) => {
     where: { id: documentId },
     select: { id: true, currentVersionId: true, userId: true, projectId: true },
   });
-  if (!doc)
-    return void res.status(404).json({ detail: "Document not found" });
+  if (!doc) return void res.status(404).json({ detail: "Document not found" });
   const access = await ensureDocAccess(doc, userId, userEmail);
-  if (!access.ok)
-    return void res.status(404).json({ detail: "Document not found" });
+  if (!access.ok) return void res.status(404).json({ detail: "Document not found" });
 
   const rows = await prisma.documentVersion.findMany({
     where: { documentId },
@@ -350,18 +318,15 @@ documentsRouter.post(
     const { documentId } = req.params;
 
     const file = req.file;
-    if (!file)
-      return void res.status(400).json({ detail: "file is required" });
+    if (!file) return void res.status(400).json({ detail: "file is required" });
 
     const doc = await prisma.document.findUnique({
       where: { id: documentId },
       select: { id: true, filename: true, fileType: true, userId: true, projectId: true },
     });
-    if (!doc)
-      return void res.status(404).json({ detail: "Document not found" });
+    if (!doc) return void res.status(404).json({ detail: "Document not found" });
     const access = await ensureDocAccess(doc, userId, userEmail);
-    if (!access.ok)
-      return void res.status(404).json({ detail: "Document not found" });
+    if (!access.ok) return void res.status(404).json({ detail: "Document not found" });
 
     const suffix = file.originalname.includes(".")
       ? file.originalname.split(".").pop()!.toLowerCase()
@@ -373,12 +338,7 @@ documentsRouter.post(
     }
 
     const versionSlug = crypto.randomUUID().replace(/-/g, "");
-    const key = versionStorageKey(
-      userId,
-      documentId,
-      versionSlug,
-      file.originalname,
-    );
+    const key = versionStorageKey(userId, documentId, versionSlug, file.originalname);
     const contentType =
       suffix === "pdf"
         ? "application/pdf"
@@ -394,9 +354,7 @@ documentsRouter.post(
       );
     } catch (e) {
       logger.error({ err: e }, "[versions/upload] storage write failed");
-      return void res
-        .status(500)
-        .json({ detail: "Failed to upload new version." });
+      return void res.status(500).json({ detail: "Failed to upload new version." });
     }
 
     let pdfStoragePath: string | null = null;
@@ -414,7 +372,10 @@ documentsRouter.post(
         );
         pdfStoragePath = pdfKey;
       } catch (err) {
-        logger.error({ err, filename: file.originalname }, "[versions/upload] DOCX→PDF conversion failed");
+        logger.error(
+          { err, filename: file.originalname },
+          "[versions/upload] DOCX→PDF conversion failed",
+        );
       }
     } else if (suffix === "pdf") {
       pdfStoragePath = key;
@@ -429,12 +390,10 @@ documentsRouter.post(
       orderBy: { versionNumber: "desc" },
       select: { versionNumber: true },
     });
-    const nextVersionNumber =
-      ((maxRow?.versionNumber as number | null) ?? 1) + 1;
+    const nextVersionNumber = ((maxRow?.versionNumber as number | null) ?? 1) + 1;
 
     const defaultDisplayName =
-      typeof req.body?.display_name === "string" &&
-      req.body.display_name.trim()
+      typeof req.body?.display_name === "string" && req.body.display_name.trim()
         ? req.body.display_name.trim().slice(0, 200)
         : file.originalname;
 
@@ -455,15 +414,12 @@ documentsRouter.post(
       currentVersionId: versionRow.id,
     };
     const providedDisplayName =
-      typeof req.body?.display_name === "string" &&
-      req.body.display_name.trim()
+      typeof req.body?.display_name === "string" && req.body.display_name.trim()
         ? req.body.display_name.trim().slice(0, 200)
         : null;
     if (providedDisplayName) {
       const hasExt = /\.[a-z0-9]{1,6}$/i.test(providedDisplayName);
-      const existingExt = doc.filename?.match(
-        /\.[a-z0-9]{1,6}$/i,
-      )?.[0];
+      const existingExt = doc.filename?.match(/\.[a-z0-9]{1,6}$/i)?.[0];
       const uploadedExt = suffix ? `.${suffix}` : "";
       const ext = hasExt ? "" : uploadedExt || existingExt || "";
       documentsUpdate.filename = `${providedDisplayName}${ext}`;
@@ -478,79 +434,61 @@ documentsRouter.post(
 );
 
 // PATCH /single-documents/:documentId/versions/:versionId
-documentsRouter.patch(
-  "/:documentId/versions/:versionId",
-  requireAuth,
-  async (req, res) => {
-    const userId = res.locals.userId as string;
-    const userEmail = res.locals.userEmail as string | undefined;
-    const { documentId, versionId } = req.params;
+documentsRouter.patch("/:documentId/versions/:versionId", requireAuth, async (req, res) => {
+  const userId = res.locals.userId as string;
+  const userEmail = res.locals.userEmail as string | undefined;
+  const { documentId, versionId } = req.params;
 
-    const doc = await prisma.document.findUnique({
-      where: { id: documentId },
-      select: { id: true, userId: true, projectId: true },
-    });
-    if (!doc)
-      return void res.status(404).json({ detail: "Document not found" });
-    const access = await ensureDocAccess(doc, userId, userEmail);
-    if (!access.ok)
-      return void res.status(404).json({ detail: "Document not found" });
+  const doc = await prisma.document.findUnique({
+    where: { id: documentId },
+    select: { id: true, userId: true, projectId: true },
+  });
+  if (!doc) return void res.status(404).json({ detail: "Document not found" });
+  const access = await ensureDocAccess(doc, userId, userEmail);
+  if (!access.ok) return void res.status(404).json({ detail: "Document not found" });
 
-    const raw = req.body?.display_name;
-    const displayName =
-      typeof raw === "string" && raw.trim() ? raw.trim().slice(0, 200) : null;
+  const raw = req.body?.display_name;
+  const displayName = typeof raw === "string" && raw.trim() ? raw.trim().slice(0, 200) : null;
 
-    const existing = await prisma.documentVersion.findFirst({
-      where: { id: versionId, documentId },
-    });
-    if (!existing) {
-      return void res.status(404).json({ detail: "Version not found" });
-    }
+  const existing = await prisma.documentVersion.findFirst({
+    where: { id: versionId, documentId },
+  });
+  if (!existing) {
+    return void res.status(404).json({ detail: "Version not found" });
+  }
 
-    const updated = await prisma.documentVersion.update({
-      where: { id: versionId },
-      data: { displayName },
-      select: { id: true, versionNumber: true, source: true, createdAt: true, displayName: true },
-    });
-    res.json(updated);
-  },
-);
+  const updated = await prisma.documentVersion.update({
+    where: { id: versionId },
+    data: { displayName },
+    select: { id: true, versionNumber: true, source: true, createdAt: true, displayName: true },
+  });
+  res.json(updated);
+});
 
 // GET /single-documents/:documentId/tracked-change-ids
-documentsRouter.get(
-  "/:documentId/tracked-change-ids",
-  requireAuth,
-  async (req, res) => {
-    const userId = res.locals.userId as string;
-    const userEmail = res.locals.userEmail as string | undefined;
-    const { documentId } = req.params;
-    const versionIdParam =
-      typeof req.query.version_id === "string" ? req.query.version_id : null;
+documentsRouter.get("/:documentId/tracked-change-ids", requireAuth, async (req, res) => {
+  const userId = res.locals.userId as string;
+  const userEmail = res.locals.userEmail as string | undefined;
+  const { documentId } = req.params;
+  const versionIdParam = typeof req.query.version_id === "string" ? req.query.version_id : null;
 
-    const doc = await prisma.document.findUnique({
-      where: { id: documentId },
-      select: { id: true, userId: true, projectId: true },
-    });
-    if (!doc)
-      return void res.status(404).json({ detail: "Document not found" });
-    const access = await ensureDocAccess(doc, userId, userEmail);
-    if (!access.ok)
-      return void res.status(404).json({ detail: "Document not found" });
+  const doc = await prisma.document.findUnique({
+    where: { id: documentId },
+    select: { id: true, userId: true, projectId: true },
+  });
+  if (!doc) return void res.status(404).json({ detail: "Document not found" });
+  const access = await ensureDocAccess(doc, userId, userEmail);
+  if (!access.ok) return void res.status(404).json({ detail: "Document not found" });
 
-    const active = await loadActiveVersion(documentId, versionIdParam);
-    if (!active)
-      return void res.status(404).json({ detail: "No file available" });
+  const active = await loadActiveVersion(documentId, versionIdParam);
+  if (!active) return void res.status(404).json({ detail: "No file available" });
 
-    const rawBytes = await downloadFile(active.storage_path);
-    if (!rawBytes)
-      return void res
-        .status(404)
-        .json({ detail: "Document bytes not available" });
+  const rawBytes = await downloadFile(active.storage_path);
+  if (!rawBytes) return void res.status(404).json({ detail: "Document bytes not available" });
 
-    const ids = await extractTrackedChangeIds(Buffer.from(rawBytes));
-    res.json({ ids });
-  },
-);
+  const ids = await extractTrackedChangeIds(Buffer.from(rawBytes));
+  res.json({ ids });
+});
 
 // POST /single-documents/:documentId/edits/:editId/accept
 // POST /single-documents/:documentId/edits/:editId/reject
@@ -567,7 +505,14 @@ async function handleEditResolution(
 
   const edit = await prisma.documentEdit.findFirst({
     where: { id: editId, documentId },
-    select: { id: true, documentId: true, changeId: true, delWId: true, insWId: true, status: true },
+    select: {
+      id: true,
+      documentId: true,
+      changeId: true,
+      delWId: true,
+      insWId: true,
+      status: true,
+    },
   });
   logger.info({ edit }, "[edit-resolution] fetched edit row");
   if (!edit) {
@@ -595,10 +540,7 @@ async function handleEditResolution(
       status: edit.status,
       version_id: doc.currentVersionId ?? null,
       download_url: activeForResolved
-        ? buildDownloadUrl(
-            activeForResolved.storage_path,
-            doc.filename ?? "document.docx",
-          )
+        ? buildDownloadUrl(activeForResolved.storage_path, doc.filename ?? "document.docx")
         : null,
       remaining_pending: 0,
     };
@@ -609,20 +551,16 @@ async function handleEditResolution(
     where: { id: documentId },
     select: { id: true, currentVersionId: true, userId: true, projectId: true },
   });
-  if (!doc)
-    return void res.status(404).json({ detail: "Document not found" });
+  if (!doc) return void res.status(404).json({ detail: "Document not found" });
   const access = await ensureDocAccess(doc, userId, userEmail);
-  if (!access.ok)
-    return void res.status(404).json({ detail: "Document not found" });
+  if (!access.ok) return void res.status(404).json({ detail: "Document not found" });
 
   const active = await loadActiveVersion(documentId);
   const latestPath = active?.storage_path ?? null;
-  if (!latestPath)
-    return void res.status(404).json({ detail: "No file to edit" });
+  if (!latestPath) return void res.status(404).json({ detail: "No file to edit" });
 
   const rawBytes = await downloadFile(latestPath);
-  if (!rawBytes)
-    return void res.status(404).json({ detail: "Document bytes not available" });
+  if (!rawBytes) return void res.status(404).json({ detail: "Document bytes not available" });
 
   const wIds = [edit.delWId, edit.insWId].filter(
     (v): v is string => typeof v === "string" && v.length > 0,
@@ -648,10 +586,7 @@ async function handleEditResolution(
     const payload = {
       ok: true,
       version_id: doc.currentVersionId,
-      download_url: buildDownloadUrl(
-        latestPath,
-        filenameRow?.filename ?? "document.docx",
-      ),
+      download_url: buildDownloadUrl(latestPath, filenameRow?.filename ?? "document.docx"),
       remaining_pending: 0,
     };
     return void res.status(200).json(payload);
@@ -687,10 +622,7 @@ async function handleEditResolution(
   const payload = {
     ok: true,
     version_id: doc.currentVersionId,
-    download_url: buildDownloadUrl(
-      latestPath,
-      filenameRow?.filename ?? "document.docx",
-    ),
+    download_url: buildDownloadUrl(latestPath, filenameRow?.filename ?? "document.docx"),
     remaining_pending: remainingPending,
   };
   res.json(payload);
@@ -718,15 +650,11 @@ async function handleDocumentUpload(
   if (!file) return void res.status(400).json({ detail: "file is required" });
 
   const filename = file.originalname;
-  const suffix = filename.includes(".")
-    ? filename.split(".").pop()!.toLowerCase()
-    : "";
+  const suffix = filename.includes(".") ? filename.split(".").pop()!.toLowerCase() : "";
   if (!ALLOWED_TYPES.has(suffix))
-    return void res
-      .status(400)
-      .json({
-        detail: `Unsupported file type: ${suffix}. Allowed: pdf, docx, doc`,
-      });
+    return void res.status(400).json({
+      detail: `Unsupported file type: ${suffix}. Allowed: pdf, docx, doc`,
+    });
 
   const content = file.buffer;
   const doc = await prisma.document.create({
@@ -819,9 +747,7 @@ async function handleDocumentUpload(
       where: { id: doc.id },
       data: { status: "failed" as any },
     });
-    return void res
-      .status(500)
-      .json({ detail: `Document processing failed: ${String(e)}` });
+    return void res.status(500).json({ detail: `Document processing failed: ${String(e)}` });
   }
 }
 
@@ -847,9 +773,7 @@ async function extractStructureTree(
 ): Promise<unknown[] | null> {
   try {
     if (fileType === "pdf") {
-      const pdfjsLib = await import(
-        "pdfjs-dist/legacy/build/pdf.mjs" as string
-      );
+      const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs" as string);
       const pdf = await (
         pdfjsLib as unknown as {
           getDocument: (opts: unknown) => {
@@ -883,15 +807,13 @@ async function extractStructureTree(
         buffer: Buffer.from(content),
       });
       const lines = result.value.split("\n").filter((l) => l.trim());
-      const nodes = lines
-        .slice(0, 30)
-        .map((line, i) => ({
-          id: `h1-${i}`,
-          title: line.slice(0, 100),
-          level: 1,
-          page_number: null,
-          children: [],
-        }));
+      const nodes = lines.slice(0, 30).map((line, i) => ({
+        id: `h1-${i}`,
+        title: line.slice(0, 100),
+        level: 1,
+        page_number: null,
+        children: [],
+      }));
       return nodes.length ? nodes : null;
     }
   } catch {

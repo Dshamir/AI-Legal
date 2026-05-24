@@ -15,6 +15,7 @@ import { sanitizeLlmInput } from "../lib/sanitize";
 import { getUserApiKeys } from "../lib/userSettings";
 import { checkProjectAccess } from "../lib/access";
 import { logger } from "../lib/logger";
+import { withStreamTimeout, StreamTimeoutError } from "../lib/streamTimeout";
 
 const PROJECT_SYSTEM_PROMPT_EXTRA = `PROJECT CONTEXT:
 You are operating within a project folder that contains a collection of legal documents the user has organised for a single matter. The user's questions will usually refer to one or more documents in this project — your job is to find the relevant files to work on. Use list_documents to see what is available and fetch_documents / read_document to pull in any documents you need before answering.
@@ -132,18 +133,20 @@ projectChatRouter.post("/", requireAuth, async (req, res) => {
   try {
     write(`data: ${JSON.stringify({ type: "chat_id", chatId })}\n\n`);
 
-    const { fullText, events } = await runLLMStream({
-      apiMessages,
-      docStore,
-      docIndex,
-      userId,
-      write,
-      extraTools: PROJECT_EXTRA_TOOLS,
-      workflowStore,
-      model,
-      apiKeys,
-      projectId,
-    });
+    const { fullText, events } = await withStreamTimeout(
+      runLLMStream({
+        apiMessages,
+        docStore,
+        docIndex,
+        userId,
+        write,
+        extraTools: PROJECT_EXTRA_TOOLS,
+        workflowStore,
+        model,
+        apiKeys,
+        projectId,
+      }),
+    );
 
     const annotations = extractAnnotations(fullText, docIndex, events);
     await prisma.chatMessage.create({
@@ -162,9 +165,17 @@ projectChatRouter.post("/", requireAuth, async (req, res) => {
       });
     }
   } catch (err) {
-    logger.error({ err }, "[project-chat/stream] error");
+    if (err instanceof StreamTimeoutError) {
+      logger.warn({ chatId }, "[project-chat/stream] LLM stream timed out");
+    } else {
+      logger.error({ err }, "[project-chat/stream] error");
+    }
     try {
-      write(`data: ${JSON.stringify({ type: "error", message: "Stream error" })}\n\n`);
+      const msg =
+        err instanceof StreamTimeoutError
+          ? "Response timed out. Please try again."
+          : "Stream error";
+      write(`data: ${JSON.stringify({ type: "error", message: msg })}\n\n`);
       write("data: [DONE]\n\n");
     } catch {
       /* ignore */
