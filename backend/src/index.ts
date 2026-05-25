@@ -15,6 +15,7 @@ import { tabularRouter } from "./routes/tabular";
 import { workflowsRouter } from "./routes/workflows";
 import { userRouter } from "./routes/user";
 import { downloadsRouter } from "./routes/downloads";
+import { writingAssistRouter } from "./routes/writingAssist";
 
 initErrorTracking();
 
@@ -37,11 +38,7 @@ function hours(value: number): number {
   return minutes(value * 60);
 }
 
-function makeLimiter(options: {
-  windowMs: number;
-  max: number;
-  message?: string;
-}) {
+function makeLimiter(options: { windowMs: number; max: number; message?: string }) {
   return rateLimit({
     windowMs: options.windowMs,
     max: options.max,
@@ -49,8 +46,7 @@ function makeLimiter(options: {
     legacyHeaders: false,
     skip: (req) => req.method === "OPTIONS",
     message: {
-      detail:
-        options.message ?? "Too many requests. Please try again later.",
+      detail: options.message ?? "Too many requests. Please try again later.",
     },
   });
 }
@@ -95,9 +91,7 @@ app.use(
       },
     },
     crossOriginEmbedderPolicy: false,
-    hsts: isProduction
-      ? { maxAge: 15552000, includeSubDomains: true }
-      : false,
+    hsts: isProduction ? { maxAge: 15552000, includeSubDomains: true } : false,
     referrerPolicy: { policy: "no-referrer" },
   }),
 );
@@ -134,6 +128,7 @@ app.use("/workflows", workflowsRouter);
 app.use("/user", userRouter);
 app.use("/users", userRouter);
 app.use("/download", downloadsRouter);
+app.use("/writing-assist", writingAssistRouter);
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
