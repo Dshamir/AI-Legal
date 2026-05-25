@@ -27,12 +27,26 @@ function asyncRoute(handler: AsyncRoute) {
   };
 }
 
-function withWorkflowAccess<T extends Record<string, unknown>>(
-  workflow: T,
+function formatWorkflow(wf: Record<string, unknown>) {
+  return {
+    id: wf.id,
+    title: wf.title,
+    type: wf.type,
+    prompt_md: wf.promptMd ?? null,
+    columns_config: wf.columnsConfig ?? null,
+    practice: wf.practice ?? null,
+    is_system: wf.isSystem ?? false,
+    created_at: wf.createdAt,
+    updated_at: wf.updatedAt,
+  };
+}
+
+function withWorkflowAccess(
+  workflow: Record<string, unknown>,
   access: { allowEdit: boolean; isOwner: boolean; sharedByName?: string | null },
 ) {
   return {
-    ...workflow,
+    ...formatWorkflow(workflow),
     allow_edit: access.allowEdit,
     is_owner: access.isOwner,
     shared_by_name: access.sharedByName ?? null,

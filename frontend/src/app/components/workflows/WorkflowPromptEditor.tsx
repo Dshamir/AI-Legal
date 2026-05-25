@@ -149,8 +149,12 @@ export function WorkflowPromptEditor({ value, onChange, readOnly = false, workfl
               (editor.storage as any).markdown.getMarkdown()
             }
             onResult={(text) => {
+              lastEmittedRef.current = text;
               editor.commands.setContent(text);
-              onChange?.(text);
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const md: string = (editor.storage as any).markdown.getMarkdown();
+              lastEmittedRef.current = md;
+              onChange?.(md);
             }}
             metadata={{ workflow_title: workflowTitle }}
           />

@@ -79,33 +79,43 @@ writingAssistRouter.post("/", requireAuth, async (req, res) => {
   const userMessage = parts.join("\n");
   const systemPrompt = SYSTEM_PROMPTS[context_type as ContextType];
 
-  try {
-    const { title_model, api_keys } = await getUserModelSettings(userId);
-    const raw = await completeText({
-      model: title_model,
-      systemPrompt,
-      user: userMessage,
-      maxTokens: 1024,
-      apiKeys: api_keys,
-    });
+  const { title_model, api_keys } = await getUserModelSettings(userId);
 
-    const parsed = JSON.parse(
-      raw
-        .replace(/^```(?:json)?\n?/i, "")
-        .replace(/\n?```$/, "")
-        .trim(),
-    ) as { text?: unknown };
+  const fallbackModels = [
+    title_model,
+    ...(api_keys.openai?.trim() ? ["gpt-5.4-nano"] : []),
+    ...(api_keys.claude?.trim() ? ["claude-haiku-4-5"] : []),
+    ...(api_keys.gemini?.trim() ? ["gemini-3.1-flash-lite-preview"] : []),
+  ];
+  const uniqueModels = [...new Set(fallbackModels)];
 
-    if (typeof parsed.text === "string" && parsed.text.trim()) {
-      res.json({ text: parsed.text.trim() });
-    } else {
-      res.status(502).json({
-        detail: "Writing assistant returned empty text",
+  let lastError: unknown;
+  for (const model of uniqueModels) {
+    try {
+      const raw = await completeText({
+        model,
+        systemPrompt,
+        user: userMessage,
+        maxTokens: 1024,
+        apiKeys: api_keys,
       });
+
+      const parsed = JSON.parse(
+        raw
+          .replace(/^```(?:json)?\n?/i, "")
+          .replace(/\n?```$/, "")
+          .trim(),
+      ) as { text?: unknown };
+
+      if (typeof parsed.text === "string" && parsed.text.trim()) {
+        return void res.json({ text: parsed.text.trim() });
+      }
+    } catch (err) {
+      lastError = err;
     }
-  } catch {
-    res.status(502).json({
-      detail: "Writing assistant failed to generate text",
-    });
   }
+
+  res.status(502).json({
+    detail: "Writing assistant failed to generate text",
+  });
 });
