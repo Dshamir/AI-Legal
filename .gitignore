@@ -21,3 +21,6 @@ coverage
 docker-compose.override.yml
 backups/
 backend/.env
+
+# Private notes (never push)
+.private-notes/
